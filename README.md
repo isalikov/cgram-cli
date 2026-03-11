@@ -26,64 +26,19 @@ The server acts as a stateless relay — it never sees message content. All encr
 
 ## Installation
 
-### macOS (Homebrew)
-
-```bash
-brew tap isalikov/tap
-brew install cgram
-```
-
-For better notification experience on macOS, install `terminal-notifier`:
-
-```bash
-brew install terminal-notifier
-```
-
-### macOS (manual)
-
-```bash
-# Apple Silicon (M1/M2/M3/M4)
-curl -Lo cgram https://github.com/isalikov/cgram-cli/releases/latest/download/cgram-darwin-arm64
-
-# Intel
-curl -Lo cgram https://github.com/isalikov/cgram-cli/releases/latest/download/cgram-darwin-amd64
-
-chmod +x cgram
-sudo mv cgram /usr/local/bin/
-```
-
-### Linux
-
-```bash
-# x86_64
-curl -Lo cgram https://github.com/isalikov/cgram-cli/releases/latest/download/cgram-linux-amd64
-
-# ARM64
-curl -Lo cgram https://github.com/isalikov/cgram-cli/releases/latest/download/cgram-linux-arm64
-
-chmod +x cgram
-sudo mv cgram /usr/local/bin/
-```
-
-### Windows
-
-Download `cgram-windows-amd64.exe` from the [Releases](https://github.com/isalikov/cgram-cli/releases/latest) page, rename to `cgram.exe` and add to `PATH`.
-
-### Docker
-
-```bash
-docker run -it ghcr.io/isalikov/cgram-cli:latest
-```
-
-### Build from source
-
 ```bash
 git clone https://github.com/isalikov/cgram-cli.git
 cd cgram-cli
 make install
 ```
 
-This builds and installs `cgram` to `/usr/local/bin/`. To remove: `make uninstall`.
+Installs `cgram` to `/usr/local/bin/`. To remove: `make uninstall`.
+
+On macOS, for better notification experience install `terminal-notifier`:
+
+```bash
+brew install terminal-notifier
+```
 
 ## Configuration
 
