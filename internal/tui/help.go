@@ -19,7 +19,7 @@ var helpEntries = []helpEntry{
 	{":", "Command mode"},
 	{":add <username>", "Add contact by username"},
 	{":rename <name>", "Rename selected contact"},
-	{":delete", "Delete selected contact (requires :delete! to confirm)"},
+	{":delete", "Delete selected contact"},
 	{":quit, :q", "Quit application"},
 	{":help", "Show this help"},
 	{"Esc", "Close overlay / exit command mode"},

@@ -76,6 +76,105 @@ jobs:
           generate_release_notes: true
           files: dist/*
 
+  update-homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Compute checksums
+        id: sha
+        run: |
+          echo "darwin_amd64=$(sha256sum dist/cgram-darwin-amd64 | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "darwin_arm64=$(sha256sum dist/cgram-darwin-arm64 | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "linux_amd64=$(sha256sum dist/cgram-linux-amd64 | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "linux_arm64=$(sha256sum dist/cgram-linux-arm64 | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: isalikov/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update formula
+        env:
+          VERSION: ${{ github.ref_name }}
+          SHA_DARWIN_AMD64: ${{ steps.sha.outputs.darwin_amd64 }}
+          SHA_DARWIN_ARM64: ${{ steps.sha.outputs.darwin_arm64 }}
+          SHA_LINUX_AMD64: ${{ steps.sha.outputs.linux_amd64 }}
+          SHA_LINUX_ARM64: ${{ steps.sha.outputs.linux_arm64 }}
+        run: |
+          VERSION="${VERSION#v}"
+          cat > homebrew-tap/Formula/cgram.rb << FORMULA
+          # typed: false
+          # frozen_string_literal: true
+
+          class Cgram < Formula
+            desc "Terminal client for cgram — anonymous end-to-end encrypted messenger"
+            homepage "https://github.com/isalikov/cgram-cli"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.intel?
+                url "https://github.com/isalikov/cgram-cli/releases/download/v${VERSION}/cgram-darwin-amd64"
+                sha256 "${SHA_DARWIN_AMD64}"
+
+                def install
+                  bin.install "cgram-darwin-amd64" => "cgram"
+                end
+              end
+              if Hardware::CPU.arm?
+                url "https://github.com/isalikov/cgram-cli/releases/download/v${VERSION}/cgram-darwin-arm64"
+                sha256 "${SHA_DARWIN_ARM64}"
+
+                def install
+                  bin.install "cgram-darwin-arm64" => "cgram"
+                end
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.intel? && Hardware::CPU.is_64_bit?
+                url "https://github.com/isalikov/cgram-cli/releases/download/v${VERSION}/cgram-linux-amd64"
+                sha256 "${SHA_LINUX_AMD64}"
+
+                def install
+                  bin.install "cgram-linux-amd64" => "cgram"
+                end
+              end
+              if Hardware::CPU.arm? && Hardware::CPU.is_64_bit?
+                url "https://github.com/isalikov/cgram-cli/releases/download/v${VERSION}/cgram-linux-arm64"
+                sha256 "${SHA_LINUX_ARM64}"
+
+                def install
+                  bin.install "cgram-linux-arm64" => "cgram"
+                end
+              end
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/cgram --version 2>&1", 2)
+            end
+          end
+          FORMULA
+          sed -i 's/^          //' homebrew-tap/Formula/cgram.rb
+
+      - name: Commit and push
+        run: |
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/cgram.rb
+          git commit -m "cgram ${GITHUB_REF_NAME}"
+          git push
+
   docker:
     runs-on: ubuntu-latest
 

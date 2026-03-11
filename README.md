@@ -26,24 +26,42 @@ The server acts as a stateless relay — it never sees message content. All encr
 
 ## Installation
 
-### Download binary
-
-Prebuilt binaries for all platforms are available on the [Releases](https://github.com/isalikov/cgram-cli/releases) page:
-
-| Platform | Binary |
-|---|---|
-| Linux x86_64 | `cgram-linux-amd64` |
-| Linux ARM64 | `cgram-linux-arm64` |
-| macOS Intel | `cgram-darwin-amd64` |
-| macOS Apple Silicon | `cgram-darwin-arm64` |
-| Windows x86_64 | `cgram-windows-amd64.exe` |
+### macOS (Homebrew)
 
 ```bash
-# Example: macOS Apple Silicon
-curl -LO https://github.com/isalikov/cgram-cli/releases/latest/download/cgram-darwin-arm64
-chmod +x cgram-darwin-arm64
-./cgram-darwin-arm64
+brew tap isalikov/tap
+brew install cgram
 ```
+
+### macOS (manual)
+
+```bash
+# Apple Silicon (M1/M2/M3/M4)
+curl -Lo cgram https://github.com/isalikov/cgram-cli/releases/latest/download/cgram-darwin-arm64
+
+# Intel
+curl -Lo cgram https://github.com/isalikov/cgram-cli/releases/latest/download/cgram-darwin-amd64
+
+chmod +x cgram
+sudo mv cgram /usr/local/bin/
+```
+
+### Linux
+
+```bash
+# x86_64
+curl -Lo cgram https://github.com/isalikov/cgram-cli/releases/latest/download/cgram-linux-amd64
+
+# ARM64
+curl -Lo cgram https://github.com/isalikov/cgram-cli/releases/latest/download/cgram-linux-arm64
+
+chmod +x cgram
+sudo mv cgram /usr/local/bin/
+```
+
+### Windows
+
+Download `cgram-windows-amd64.exe` from the [Releases](https://github.com/isalikov/cgram-cli/releases/latest) page, rename to `cgram.exe` and add to `PATH`.
 
 ### Docker
 

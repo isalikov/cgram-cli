@@ -33,6 +33,7 @@ type Identity struct {
 	UserID          string
 	Username        string
 	SessionToken    string
+	AuthPassword    string
 	Ed25519Private  []byte
 	Ed25519Public   []byte
 	X25519Private   []byte
@@ -108,34 +109,41 @@ func migrate(db *sql.DB) error {
 
 	CREATE INDEX IF NOT EXISTS idx_messages_contact ON messages(contact_id, timestamp);
 	`
-	_, err := db.Exec(schema)
-	return err
+	if _, err := db.Exec(schema); err != nil {
+		return err
+	}
+
+	// Migration: add auth_password column if missing
+	db.Exec("ALTER TABLE identity ADD COLUMN auth_password TEXT NOT NULL DEFAULT ''")
+
+	return nil
 }
 
 // Identity
 
 func (s *Store) SaveIdentity(id *Identity) error {
 	_, err := s.db.Exec(`
-		INSERT INTO identity (id, user_id, username, session_token, ed25519_private, ed25519_public, x25519_private, x25519_public)
-		VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO identity (id, user_id, username, session_token, auth_password, ed25519_private, ed25519_public, x25519_private, x25519_public)
+		VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (id) DO UPDATE SET
 			user_id = excluded.user_id,
 			username = excluded.username,
 			session_token = excluded.session_token,
+			auth_password = excluded.auth_password,
 			ed25519_private = excluded.ed25519_private,
 			ed25519_public = excluded.ed25519_public,
 			x25519_private = excluded.x25519_private,
 			x25519_public = excluded.x25519_public
-	`, id.UserID, id.Username, id.SessionToken, id.Ed25519Private, id.Ed25519Public, id.X25519Private, id.X25519Public)
+	`, id.UserID, id.Username, id.SessionToken, id.AuthPassword, id.Ed25519Private, id.Ed25519Public, id.X25519Private, id.X25519Public)
 	return err
 }
 
 func (s *Store) GetIdentity() (*Identity, error) {
 	id := &Identity{}
 	err := s.db.QueryRow(`
-		SELECT user_id, username, session_token, ed25519_private, ed25519_public, x25519_private, x25519_public
+		SELECT user_id, username, session_token, auth_password, ed25519_private, ed25519_public, x25519_private, x25519_public
 		FROM identity WHERE id = 1
-	`).Scan(&id.UserID, &id.Username, &id.SessionToken, &id.Ed25519Private, &id.Ed25519Public, &id.X25519Private, &id.X25519Public)
+	`).Scan(&id.UserID, &id.Username, &id.SessionToken, &id.AuthPassword, &id.Ed25519Private, &id.Ed25519Public, &id.X25519Private, &id.X25519Public)
 	if err != nil {
 		return nil, err
 	}

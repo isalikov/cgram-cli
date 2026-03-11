@@ -1,11 +1,9 @@
 package tui
 
 import (
-	"fmt"
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/isalikov/cgram-cli/internal/store"
 )
@@ -14,7 +12,6 @@ type ChatModel struct {
 	messages    []store.Message
 	contactName string
 	contactID   string
-	input       InputModel
 	focused     bool
 	width       int
 	height      int
@@ -23,116 +20,81 @@ type ChatModel struct {
 }
 
 func NewChat() ChatModel {
-	return ChatModel{
-		input: NewInput("Type a message..."),
-	}
+	return ChatModel{}
 }
 
 func (m *ChatModel) SetMessages(msgs []store.Message)  { m.messages = msgs; m.scrollOff = 0 }
 func (m *ChatModel) SetContact(id, name string)        { m.contactID = id; m.contactName = name }
-func (m *ChatModel) SetFocused(f bool)                 { m.focused = f; if f { m.input.Focus() } else { m.input.Blur() } }
-func (m *ChatModel) SetSize(w, h int)                  { m.width = w; m.height = h; m.input.SetWidth(w - 4) }
+func (m *ChatModel) SetFocused(f bool)                 { m.focused = f }
+func (m *ChatModel) SetSize(w, h int)                  { m.width = w; m.height = h }
 func (m *ChatModel) SetMyUsername(u string)             { m.myUsername = u }
 func (m ChatModel) ContactID() string                   { return m.contactID }
-func (m ChatModel) InputValue() string                  { return m.input.Value() }
-func (m *ChatModel) ResetInput()                        { m.input.Reset() }
+func (m ChatModel) ContactName() string                 { return m.contactName }
 func (m *ChatModel) AppendMessage(msg store.Message)    { m.messages = append(m.messages, msg) }
+func (m ChatModel) MessageCount() int                   { return len(m.messages) }
 
-type SendMessageMsg struct {
-	ContactID string
-	Content   string
+func (m *ChatModel) ScrollUp(n int) {
+	m.scrollOff += n
 }
 
-func (m ChatModel) Update(msg tea.Msg) (ChatModel, tea.Cmd) {
-	if !m.focused {
-		return m, nil
+func (m *ChatModel) ScrollDown(n int) {
+	m.scrollOff -= n
+	if m.scrollOff < 0 {
+		m.scrollOff = 0
 	}
-
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch {
-		case isKey(msg, "alt+enter"):
-			m.input = m.input.InsertNewline()
-			return m, nil
-
-		case isKey(msg, "enter"):
-			content := strings.TrimSpace(m.input.Value())
-			if content != "" {
-				m.input.Reset()
-				return m, func() tea.Msg {
-					return SendMessageMsg{ContactID: m.contactID, Content: content}
-				}
-			}
-			return m, nil
-
-		case isKey(msg, "pgup"):
-			m.scrollOff += 5
-			return m, nil
-
-		case isKey(msg, "pgdown"):
-			m.scrollOff -= 5
-			if m.scrollOff < 0 {
-				m.scrollOff = 0
-			}
-			return m, nil
-
-		default:
-			m.input, _ = m.input.Update(msg)
-		}
-	}
-
-	return m, nil
 }
 
 func (m ChatModel) msgAreaHeight() int {
-	// Total height - title(2) - input(3) - borders
-	return m.height - 7
+	// Total height - header(1) - top sep(1) - bottom sep(1)
+	h := m.height - 3
+	if h < 1 {
+		h = 1
+	}
+	return h
 }
 
 func (m ChatModel) View() string {
-	style := PanelStyle
-	if m.focused {
-		style = ActivePanelStyle
-	}
-
 	if m.contactID == "" {
 		empty := lipgloss.Place(
-			m.width-2, m.height-2,
+			m.width, m.height,
 			lipgloss.Center, lipgloss.Center,
 			SubtitleStyle.Render("Select a contact to start chatting"),
 		)
-		return style.Width(m.width).Height(m.height).Render(empty)
+		return empty
 	}
 
-	// Title
-	title := TitleStyle.Render(fmt.Sprintf("  Chat with %s", m.contactName))
+	// Header: @name [online] left, last seen: now right
+	headerLeft := ChatHeaderNameStyle.Render("@"+m.contactName) + " " +
+		ChatHeaderStatusStyle.Render("[online]")
+	headerRight := ChatHeaderDimStyle.Render("last seen: now")
+	headerPad := m.width - lipgloss.Width(headerLeft) - lipgloss.Width(headerRight)
+	if headerPad < 1 {
+		headerPad = 1
+	}
+	header := headerLeft + strings.Repeat(" ", headerPad) + headerRight
+
+	// Top separator ╭──────╮
+	topSep := ChatSeparatorStyle.Render("╭" + strings.Repeat("─", max(0, m.width-2)) + "╮")
 
 	// Messages area
 	msgHeight := m.msgAreaHeight()
-	msgWidth := m.width - 4
-
-	if msgHeight < 1 {
-		msgHeight = 1
-	}
+	msgWidth := m.width - 2 // some margin
 
 	var msgArea string
 
 	if len(m.messages) == 0 {
-		// Empty state hint
 		msgArea = lipgloss.Place(
-			msgWidth, msgHeight,
+			m.width, msgHeight,
 			lipgloss.Center, lipgloss.Center,
 			SubtitleStyle.Render("No messages yet. Say hello!"),
 		)
 	} else {
-		// Build all visual lines (each message may produce multiple lines)
 		var allLines []string
 		for _, msg := range m.messages {
 			rendered := m.renderMessage(msg, msgWidth)
 			allLines = append(allLines, strings.Split(rendered, "\n")...)
 		}
 
-		// Apply scroll offset (from bottom, in visual line units)
 		totalLines := len(allLines)
 		scrollOff := m.scrollOff
 		maxScroll := max(0, totalLines-msgHeight)
@@ -149,93 +111,67 @@ func (m ChatModel) View() string {
 		visible := allLines[start:end]
 		msgArea = strings.Join(visible, "\n")
 
-		// Pad to fill height
 		lineCount := len(visible)
 		if lineCount < msgHeight {
 			msgArea += strings.Repeat("\n", msgHeight-lineCount)
 		}
 	}
 
-	// Input area
-	inputSep := SubtitleStyle.Render(strings.Repeat("─", m.width-4))
+	// Bottom separator ╰──────╯
+	bottomSep := ChatSeparatorStyle.Render("╰" + strings.Repeat("─", max(0, m.width-2)) + "╯")
 
-	inputPrefix := lipgloss.NewStyle().Foreground(Nord8).Render("> ")
-	inputView := inputPrefix + m.input.View()
-	inputHint := SubtitleStyle.Render("  (Alt+Enter for new line)")
-
-	content := lipgloss.JoinVertical(lipgloss.Left,
-		title,
-		"",
+	return lipgloss.JoinVertical(lipgloss.Left,
+		header,
+		topSep,
 		msgArea,
-		inputSep,
-		inputView,
-		inputHint,
+		bottomSep,
 	)
-
-	return style.Width(m.width).Height(m.height).Render(content)
 }
 
 func (m ChatModel) renderMessage(msg store.Message, width int) string {
-	timeStr := TimestampStyle.Render(formatTimestamp(msg.Timestamp))
+	timeStr := TimestampStyle.Render("[" + formatTimestamp(msg.Timestamp) + "]")
 
 	if msg.IsMine {
-		name := MyMessageStyle.Render(m.myUsername + " ")
-		arrow := SubtitleStyle.Render("◄")
-
-		// Calculate available content width
-		overhead := lipgloss.Width(timeStr) + lipgloss.Width(name) + lipgloss.Width(arrow) + 6
-		contentWidth := width - overhead
-		if contentWidth < 10 {
-			contentWidth = 10
-		}
+		label := MyNameStyle.Render("you") + " " + timeStr
+		contentWidth := max(10, width*2/3)
 
 		wrapped := wrapText(msg.Content, contentWidth)
 		wLines := strings.Split(wrapped, "\n")
 
 		var result []string
-		for i, line := range wLines {
-			styledContent := lipgloss.NewStyle().Foreground(Nord4).Render(line)
-			if i == len(wLines)-1 {
-				// Last line: include metadata
-				right := fmt.Sprintf("%s  %s %s%s", styledContent, timeStr, name, arrow)
-				pad := width - lipgloss.Width(right)
-				if pad < 0 {
-					pad = 0
-				}
-				result = append(result, strings.Repeat(" ", pad)+right)
-			} else {
-				// Continuation: right-aligned
-				pad := width - lipgloss.Width(styledContent)
-				if pad < 0 {
-					pad = 0
-				}
-				result = append(result, strings.Repeat(" ", pad)+styledContent)
+		// Label right-aligned
+		labelPad := width - lipgloss.Width(label)
+		if labelPad < 0 {
+			labelPad = 0
+		}
+		result = append(result, strings.Repeat(" ", labelPad)+label)
+
+		// Content lines right-aligned with > arrow
+		arrow := MyNameStyle.Render("> ")
+		for _, line := range wLines {
+			styled := arrow + BubbleTextStyle.Render(line)
+			pad := width - lipgloss.Width(styled)
+			if pad < 0 {
+				pad = 0
 			}
+			result = append(result, strings.Repeat(" ", pad)+styled)
 		}
 		return strings.Join(result, "\n")
 	}
 
-	name := TheirMessageStyle.Render(m.contactName)
-	arrow := SubtitleStyle.Render("►")
-
-	overhead := lipgloss.Width(timeStr) + lipgloss.Width(name) + lipgloss.Width(arrow) + 8
-	contentWidth := width - overhead
-	if contentWidth < 10 {
-		contentWidth = 10
-	}
+	// Left-aligned
+	label := TheirNameStyle.Render("@"+m.contactName) + " " + timeStr
+	contentWidth := max(10, width*2/3)
 
 	wrapped := wrapText(msg.Content, contentWidth)
 	wLines := strings.Split(wrapped, "\n")
 
 	var result []string
-	indent := "  " + strings.Repeat(" ", lipgloss.Width(arrow)+lipgloss.Width(name)+2)
-	for i, line := range wLines {
-		styledContent := lipgloss.NewStyle().Foreground(Nord4).Render(line)
-		if i == 0 {
-			result = append(result, fmt.Sprintf("  %s %s %s  %s", arrow, name, styledContent, timeStr))
-		} else {
-			result = append(result, indent+styledContent)
-		}
+	result = append(result, label)
+
+	arrow := TheirNameStyle.Render("< ")
+	for _, line := range wLines {
+		result = append(result, " "+arrow+BubbleTextStyle.Render(line))
 	}
 	return strings.Join(result, "\n")
 }
@@ -285,3 +221,4 @@ func wrapText(text string, width int) string {
 	}
 	return strings.Join(lines, "\n")
 }
+

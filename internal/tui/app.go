@@ -33,28 +33,41 @@ const (
 	focusChat
 )
 
+type inputMode int
+
+const (
+	modeNormal inputMode = iota
+	modeInsert
+	modeCommand
+)
+
+type SendMessageMsg struct {
+	ContactID string
+	Content   string
+}
+
 type AppModel struct {
 	screen     screen
 	focus      focus
+	mode       inputMode
 	welcome    WelcomeModel
 	contacts   ContactsModel
 	chat       ChatModel
+	input      InputModel
 	toast      *Toast
 	showHelp   bool
-	commandMode bool
-	commandBuf  string
+	commandBuf string
 	width      int
 	height     int
 
 	client   *client.Client
-	store    *store.Store // nil until login/register
+	store    *store.Store
 	identity *store.Identity
 
 	dataDir      string
 	serverAddr   string
 	wasConnected bool
 
-	// Kept in memory for re-auth on reconnect
 	authUsername string
 	authPassword string
 }
@@ -83,13 +96,22 @@ type sendErrorMsg struct{ err string }
 func NewApp(cl *client.Client, dataDir string, serverAddr string) AppModel {
 	return AppModel{
 		screen:     screenWelcome,
+		mode:       modeNormal,
 		client:     cl,
 		dataDir:    dataDir,
 		serverAddr: serverAddr,
 		welcome:    NewWelcome(serverAddr, cl.Connected()),
 		contacts:   NewContacts(),
 		chat:       NewChat(),
+		input:      NewInput("Type a message..."),
 	}
+}
+
+type autoLoginMsg struct {
+	store    *store.Store
+	identity *store.Identity
+	username string
+	password string
 }
 
 func (m AppModel) Init() tea.Cmd {
@@ -97,7 +119,43 @@ func (m AppModel) Init() tea.Cmd {
 		tea.WindowSize(),
 		m.connectCmd(),
 		m.waitForStatus(),
+		m.tryAutoLogin(),
 	)
+}
+
+func (m AppModel) tryAutoLogin() tea.Cmd {
+	dataDir := m.dataDir
+	return func() tea.Msg {
+		sessionFile := filepath.Join(dataDir, "session")
+		data, err := os.ReadFile(sessionFile)
+		if err != nil {
+			return nil
+		}
+		username := strings.TrimSpace(string(data))
+		if username == "" {
+			return nil
+		}
+		st, err := openStore(dataDir, username)
+		if err != nil {
+			return nil
+		}
+		identity, err := st.GetIdentity()
+		if err != nil || identity.AuthPassword == "" {
+			st.Close()
+			return nil
+		}
+		return autoLoginMsg{
+			store:    st,
+			identity: identity,
+			username: username,
+			password: identity.AuthPassword,
+		}
+	}
+}
+
+func saveSession(dataDir, username string) {
+	os.MkdirAll(dataDir, 0700)
+	os.WriteFile(filepath.Join(dataDir, "session"), []byte(username), 0600)
 }
 
 func (m AppModel) connectCmd() tea.Cmd {
@@ -111,7 +169,6 @@ func (m AppModel) connectCmd() tea.Cmd {
 	}
 }
 
-// waitForStatus listens for connection state changes from the client.
 func (m AppModel) waitForStatus() tea.Cmd {
 	ch := m.client.Status
 	return func() tea.Msg {
@@ -123,7 +180,6 @@ func (m AppModel) waitForStatus() tea.Cmd {
 	}
 }
 
-// openStore creates ~/.cgram/ if needed and opens ~/.cgram/<username>.db
 func openStore(dataDir, username string) (*store.Store, error) {
 	if err := os.MkdirAll(dataDir, 0700); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
@@ -144,7 +200,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
-		// Global keys
+		// Global quit
 		if isKey(msg, "ctrl+c") {
 			if m.store != nil {
 				m.store.Close()
@@ -152,7 +208,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 
-		// Help overlay toggle
+		// Help overlay
 		if m.showHelp {
 			if isKey(msg, "esc") {
 				m.showHelp = false
@@ -160,18 +216,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		// Command mode
-		if m.commandMode {
-			return m.handleCommandMode(msg)
-		}
-
-		if m.screen == screenMain && isKey(msg, ":") {
-			m.commandMode = true
-			m.commandBuf = ""
-			return m, nil
-		}
-
-		// Screen-specific keys
+		// Route by screen
 		switch m.screen {
 		case screenWelcome:
 			var cmd tea.Cmd
@@ -179,39 +224,19 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, cmd)
 
 		case screenMain:
-			if isKey(msg, "tab") {
-				if m.focus == focusContacts {
-					m.focus = focusChat
-				} else {
-					m.focus = focusContacts
-				}
-				m.updateFocus()
-				return m, nil
-			}
+			return m.updateMain(msg)
+		}
 
-			if m.focus == focusContacts && isKey(msg, "enter") {
-				if c := m.contacts.SelectedContact(); c != nil {
-					m.openChat(c)
-				}
-				return m, nil
-			}
-
-			switch m.focus {
-			case focusContacts:
-				var cmd tea.Cmd
-				m.contacts, cmd = m.contacts.Update(msg)
-				cmds = append(cmds, cmd)
-			case focusChat:
-				var cmd tea.Cmd
-				m.chat, cmd = m.chat.Update(msg)
-				cmds = append(cmds, cmd)
-			}
+	case autoLoginMsg:
+		// Saved session found — auto-login
+		if m.screen == screenWelcome && msg.store != nil {
+			m.welcome.SetLoading(true)
+			return m, m.doAutoLogin(msg.store, msg.identity, msg.username, msg.password)
 		}
 
 	case connectedMsg:
 		m.welcome.SetConnected(true)
 		m.wasConnected = true
-		// Re-authenticate if we have stored credentials (reconnect scenario)
 		if m.authUsername != "" && m.authPassword != "" && m.store != nil {
 			cmds = append(cmds, m.reAuthCmd())
 		}
@@ -238,11 +263,15 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.identity = msg.identity
 		m.authUsername = msg.username
 		m.authPassword = msg.password
+		// Persist session
+		saveSession(m.dataDir, msg.username)
+		msg.identity.AuthPassword = msg.password
+		m.store.SaveIdentity(msg.identity)
 		m.screen = screenMain
 		m.focus = focusContacts
+		m.mode = modeNormal
 		m.updateFocus()
 		m.updateLayout()
-		// Set up re-auth on reconnect
 		cl := m.client
 		username := msg.username
 		password := msg.password
@@ -293,25 +322,135 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case incomingFrameMsg:
 		cmd := m.handleIncoming(msg.frame)
-		// Re-subscribe for next message
 		return m, tea.Batch(cmd, m.waitForMessage())
 
 	case dismissToastMsg:
 		m.toast = nil
-
 	}
 
 	return m, tea.Batch(cmds...)
 }
 
-func (m *AppModel) handleCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+// ── Vim mode routing ──
+
+func (m *AppModel) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch m.mode {
+	case modeNormal:
+		return m.updateNormal(msg)
+	case modeInsert:
+		return m.updateInsert(msg)
+	case modeCommand:
+		return m.updateCommand(msg)
+	}
+	return m, nil
+}
+
+func (m *AppModel) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch {
+	case isKey(msg, "i"):
+		m.mode = modeInsert
+		m.input.Focus()
+		return m, nil
+
+	case isKey(msg, "a"):
+		m.mode = modeInsert
+		m.input.Focus()
+		// Move cursor to end
+		row := len(m.input.lines) - 1
+		m.input.cursorRow = row
+		m.input.cursorCol = len(m.input.lines[row])
+		return m, nil
+
+	case isKey(msg, ":"):
+		m.mode = modeCommand
+		m.commandBuf = ""
+		return m, nil
+
+	case isKey(msg, "tab"):
+		if m.focus == focusContacts {
+			m.focus = focusChat
+		} else {
+			m.focus = focusContacts
+		}
+		m.updateFocus()
+		return m, nil
+
+	case isKey(msg, "j", "down"):
+		if m.focus == focusContacts {
+			m.contacts.MoveDown()
+		} else {
+			m.chat.ScrollDown(3)
+		}
+		return m, nil
+
+	case isKey(msg, "k", "up"):
+		if m.focus == focusContacts {
+			m.contacts.MoveUp()
+		} else {
+			m.chat.ScrollUp(3)
+		}
+		return m, nil
+
+	case isKey(msg, "pgup"):
+		m.chat.ScrollUp(10)
+		return m, nil
+
+	case isKey(msg, "pgdown"):
+		m.chat.ScrollDown(10)
+		return m, nil
+
+	case isKey(msg, "enter"):
+		if m.focus == focusContacts {
+			if c := m.contacts.SelectedContact(); c != nil {
+				m.openChat(c)
+			}
+		}
+		return m, nil
+
+	case isKey(msg, "esc"):
+		m.showHelp = false
+		return m, nil
+	}
+
+	return m, nil
+}
+
+func (m *AppModel) updateInsert(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
 	case isKey(msg, "esc"):
-		m.commandMode = false
+		m.mode = modeNormal
+		m.input.Blur()
+		return m, nil
+
+	case isKey(msg, "alt+enter"):
+		m.input = m.input.InsertNewline()
+		return m, nil
+
+	case isKey(msg, "enter"):
+		content := strings.TrimSpace(m.input.Value())
+		if content != "" && m.chat.ContactID() != "" {
+			m.input.Reset()
+			return m, func() tea.Msg {
+				return SendMessageMsg{ContactID: m.chat.ContactID(), Content: content}
+			}
+		}
+		return m, nil
+
+	default:
+		m.input, _ = m.input.Update(msg)
+		return m, nil
+	}
+}
+
+func (m *AppModel) updateCommand(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch {
+	case isKey(msg, "esc"):
+		m.mode = modeNormal
 		m.commandBuf = ""
+		return m, nil
 	case isKey(msg, "enter"):
 		cmd := m.executeCommand(m.commandBuf)
-		m.commandMode = false
+		m.mode = modeNormal
 		m.commandBuf = ""
 		return m, cmd
 	case isKey(msg, "backspace"):
@@ -328,6 +467,8 @@ func (m *AppModel) handleCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	return m, nil
 }
+
+// ── Commands ──
 
 func (m *AppModel) executeCommand(cmd string) tea.Cmd {
 	parts := strings.Fields(cmd)
@@ -360,7 +501,6 @@ func (m *AppModel) executeCommand(cmd string) tea.Cmd {
 			return m.showToast("Not logged in", true)
 		}
 		username := parts[1]
-		// Prevent adding yourself
 		if m.identity != nil && username == m.identity.Username {
 			return m.showToast("Cannot add yourself as a contact", true)
 		}
@@ -397,7 +537,6 @@ func (m *AppModel) executeCommand(cmd string) tea.Cmd {
 		if err := m.store.RenameContact(c.UserID, newName); err != nil {
 			return m.showToast("Failed to rename contact", true)
 		}
-		// Update chat header if this contact is open
 		if m.chat.ContactID() == c.UserID {
 			m.chat.SetContact(c.UserID, newName)
 		}
@@ -406,17 +545,7 @@ func (m *AppModel) executeCommand(cmd string) tea.Cmd {
 			func() tea.Msg { return contactsUpdatedMsg{} },
 		)
 
-	case "delete":
-		if m.store == nil {
-			return m.showToast("Not logged in", true)
-		}
-		c := m.contacts.SelectedContact()
-		if c == nil {
-			return m.showToast("No contact selected", true)
-		}
-		return m.showToast(fmt.Sprintf("Delete %s? Type :delete! to confirm", c.Name), false)
-
-	case "delete!":
+	case "delete", "delete!":
 		if m.store == nil {
 			return m.showToast("Not logged in", true)
 		}
@@ -438,6 +567,8 @@ func (m *AppModel) executeCommand(cmd string) tea.Cmd {
 	}
 }
 
+// ── Helpers ──
+
 func (m *AppModel) showToast(msg string, isErr bool) tea.Cmd {
 	m.toast = &Toast{Message: msg, IsError: isErr, ShowAt: time.Now()}
 	return toastTick()
@@ -452,15 +583,15 @@ func (m *AppModel) updateLayout() {
 	if m.screen != screenMain {
 		return
 	}
-	contactsW := m.width / 4
-	if contactsW < 20 {
-		contactsW = 20
-	}
+	contactsW := max(18, m.width/5)
+	// -1 for separator column
 	chatW := m.width - contactsW - 1
-	mainH := m.height - 1 // status bar
+	// height - topbar(1) - modeline(1) - inputline(1) - colline(1) - statusbar(1)
+	mainH := m.height - 5
 
 	m.contacts.SetSize(contactsW, mainH)
 	m.chat.SetSize(chatW, mainH)
+	m.input.SetWidth(chatW)
 }
 
 func (m *AppModel) openChat(c *store.Contact) {
@@ -501,6 +632,39 @@ func (m AppModel) reAuthCmd() tea.Cmd {
 	}
 }
 
+// ── Auth commands ──
+
+func (m AppModel) doAutoLogin(st *store.Store, identity *store.Identity, username, password string) tea.Cmd {
+	cl := m.client
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		resp, err := cl.Send(ctx, &pb.Frame{
+			RequestId: uuid.NewString(),
+			Payload: &pb.Frame_LoginRequest{LoginRequest: &pb.LoginRequest{
+				Username:    username,
+				AuthMessage: []byte(password),
+			}},
+		})
+		if err != nil {
+			st.Close()
+			return authErrorMsg{err: "Auto-login failed: " + err.Error()}
+		}
+
+		lr, ok := resp.Payload.(*pb.Frame_LoginResponse)
+		if !ok {
+			st.Close()
+			return authErrorMsg{err: "Auto-login failed"}
+		}
+
+		identity.SessionToken = lr.LoginResponse.SessionToken
+		st.SaveIdentity(identity)
+
+		return authSuccessMsg{store: st, identity: identity, token: lr.LoginResponse.SessionToken, username: username, password: password}
+	}
+}
+
 func (m AppModel) doRegister(username, password string) tea.Cmd {
 	cl := m.client
 	dataDir := m.dataDir
@@ -509,13 +673,11 @@ func (m AppModel) doRegister(username, password string) tea.Cmd {
 			return authErrorMsg{err: "username and password are required"}
 		}
 
-		// Open per-user database
 		st, err := openStore(dataDir, username)
 		if err != nil {
 			return authErrorMsg{err: fmt.Sprintf("database error: %v", err)}
 		}
 
-		// Generate identity keys
 		edKey, err := crypto.GenerateEd25519()
 		if err != nil {
 			st.Close()
@@ -550,7 +712,6 @@ func (m AppModel) doRegister(username, password string) tea.Cmd {
 			return authErrorMsg{err: "unexpected response"}
 		}
 
-		// Save identity
 		identity := &store.Identity{
 			UserID:         rr.RegisterResponse.UserId,
 			Username:       username,
@@ -560,7 +721,6 @@ func (m AppModel) doRegister(username, password string) tea.Cmd {
 			X25519Public:   x25519Key.Public,
 		}
 
-		// Login
 		loginResp, err := cl.Send(ctx, &pb.Frame{
 			RequestId: uuid.NewString(),
 			Payload: &pb.Frame_LoginRequest{LoginRequest: &pb.LoginRequest{
@@ -585,7 +745,6 @@ func (m AppModel) doRegister(username, password string) tea.Cmd {
 			return authErrorMsg{err: "failed to save identity"}
 		}
 
-		// Upload pre-key bundle
 		spk, sig, otks, err := crypto.GeneratePreKeyBundle(edKey.Private, 10)
 		if err == nil {
 			oneTimeKeys := make([][]byte, len(otks))
@@ -617,7 +776,6 @@ func (m AppModel) doLogin(username, password string) tea.Cmd {
 			return authErrorMsg{err: "username and password are required"}
 		}
 
-		// Open per-user database
 		st, err := openStore(dataDir, username)
 		if err != nil {
 			return authErrorMsg{err: fmt.Sprintf("database error: %v", err)}
@@ -644,7 +802,6 @@ func (m AppModel) doLogin(username, password string) tea.Cmd {
 			return authErrorMsg{err: "unexpected response"}
 		}
 
-		// Load existing identity — if none exists, require registration
 		identity, err := st.GetIdentity()
 		if err != nil {
 			st.Close()
@@ -659,6 +816,8 @@ func (m AppModel) doLogin(username, password string) tea.Cmd {
 	}
 }
 
+// ── Message handling ──
+
 func (m AppModel) sendMessageCmd(contactID, content string) tea.Cmd {
 	cl := m.client
 	st := m.store
@@ -671,7 +830,6 @@ func (m AppModel) sendMessageCmd(contactID, content string) tea.Cmd {
 		msgID := uuid.NewString()
 		now := time.Now()
 
-		// Build message payload
 		payload := &pb.MessagePayload{
 			MessageId: msgID,
 			SenderId:  "",
@@ -680,7 +838,7 @@ func (m AppModel) sendMessageCmd(contactID, content string) tea.Cmd {
 		}
 
 		if identity != nil {
-			payload.SenderId = identity.UserID
+			payload.SenderId = identity.UserID + ":" + identity.Username
 		}
 
 		payloadBytes, err := proto.Marshal(payload)
@@ -688,8 +846,7 @@ func (m AppModel) sendMessageCmd(contactID, content string) tea.Cmd {
 			return sendErrorMsg{err: "failed to encode message"}
 		}
 
-		// Encrypt
-		ciphertext := payloadBytes // fallback: unencrypted if no session
+		ciphertext := payloadBytes
 		var ratchetIdx uint32
 
 		if cs, err := st.GetCryptoSession(contactID); err == nil {
@@ -700,7 +857,6 @@ func (m AppModel) sendMessageCmd(contactID, content string) tea.Cmd {
 			}
 		}
 
-		// Send envelope
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
@@ -717,7 +873,6 @@ func (m AppModel) sendMessageCmd(contactID, content string) tea.Cmd {
 			return sendErrorMsg{err: err.Error()}
 		}
 
-		// Save locally only after successful send
 		st.SaveMessage(&store.Message{
 			ID:        msgID,
 			ContactID: contactID,
@@ -744,13 +899,10 @@ func (m *AppModel) handleIncomingEnvelope(env *pb.Envelope) tea.Cmd {
 		return nil
 	}
 
-	// Try to decrypt
 	var payload pb.MessagePayload
 	decrypted := false
-
 	senderID := ""
 
-	// Try decryption with crypto session
 	contacts, _ := m.store.ListContacts()
 	for _, c := range contacts {
 		if cs, err := m.store.GetCryptoSession(c.UserID); err == nil {
@@ -766,7 +918,6 @@ func (m *AppModel) handleIncomingEnvelope(env *pb.Envelope) tea.Cmd {
 	}
 
 	if !decrypted {
-		// Try to unmarshal as plaintext (no encryption)
 		if err := proto.Unmarshal(env.Ciphertext, &payload); err == nil {
 			decrypted = true
 			senderID = payload.SenderId
@@ -777,7 +928,13 @@ func (m *AppModel) handleIncomingEnvelope(env *pb.Envelope) tea.Cmd {
 		return nil
 	}
 
-	// Extract text content
+	// Parse "userId:username" format from SenderId
+	senderUsername := ""
+	if parts := strings.SplitN(senderID, ":", 2); len(parts) == 2 {
+		senderID = parts[0]
+		senderUsername = parts[1]
+	}
+
 	var content string
 	switch c := payload.Content.(type) {
 	case *pb.MessagePayload_Text:
@@ -790,12 +947,14 @@ func (m *AppModel) handleIncomingEnvelope(env *pb.Envelope) tea.Cmd {
 		return nil
 	}
 
-	// Ensure contact exists with a readable name
-	displayName := senderID
-	if len(senderID) > 8 {
-		displayName = "user-" + senderID[:8]
+	// Use extracted username, then fall back to existing contact name, then truncated ID
+	displayName := senderUsername
+	if displayName == "" {
+		displayName = senderID
+		if len(senderID) > 8 {
+			displayName = "user-" + senderID[:8]
+		}
 	}
-	// Check if contact already exists with a proper name
 	for _, c := range contacts {
 		if c.UserID == senderID {
 			displayName = c.Name
@@ -830,13 +989,14 @@ func (m *AppModel) handleIncomingEnvelope(env *pb.Envelope) tea.Cmd {
 		m.chat.AppendMessage(*msg)
 	} else {
 		m.store.IncrementUnread(senderID)
-		// Find sender name for notification
-		name := displayName
-		go notify.NewMessage(name, content)
 	}
+
+	go notify.NewMessage(displayName, content)
 
 	return func() tea.Msg { return contactsUpdatedMsg{} }
 }
+
+// ── View ──
 
 func (m AppModel) View() string {
 	var view string
@@ -848,15 +1008,12 @@ func (m AppModel) View() string {
 		view = m.mainView()
 	}
 
-	// Help overlay
 	if m.showHelp {
 		view = renderHelp(m.width, m.height)
 	}
 
-	// Toast overlay
 	if m.toast != nil && time.Since(m.toast.ShowAt) < 3*time.Second {
 		toastView := m.toast.View(m.width)
-		// Overlay toast at top
 		lines := strings.Split(view, "\n")
 		toastLines := strings.Split(toastView, "\n")
 		for i, tl := range toastLines {
@@ -871,49 +1028,146 @@ func (m AppModel) View() string {
 }
 
 func (m AppModel) mainView() string {
+	topBar := m.renderTopBar()
 	contactsView := m.contacts.View()
 	chatView := m.chat.View()
 
-	main := lipgloss.JoinHorizontal(lipgloss.Top, contactsView, chatView)
+	// Separator column
+	contactsW := m.contacts.width
+	chatW := m.chat.width
+	mainH := m.height - 5
 
-	// Status bar
-	statusConnected := OnlineStyle.Render("● connected")
-	if !m.client.Connected() {
-		statusConnected = OfflineStyle.Render("● disconnected")
+	sep := make([]string, mainH)
+	for i := range sep {
+		sep[i] = SeparatorStyle.Render("│")
 	}
+	separator := strings.Join(sep, "\n")
 
-	// Show username and truncated ID
-	var userInfo string
-	if m.identity != nil && m.identity.UserID != "" {
-		uid := m.identity.UserID
-		if len(uid) > 8 {
-			uid = uid[:8]
-		}
-		userInfo = " " + SubtitleStyle.Render(m.identity.Username+"@"+uid)
-	}
+	mainArea := lipgloss.JoinHorizontal(lipgloss.Top, contactsView, separator, chatView)
 
-	statusRight := SubtitleStyle.Render(":help")
+	modeLine := m.renderModeLine()
+	inputLine := m.renderInputLine(contactsW + 1 + chatW)
+	statusBar := m.renderStatusBar()
 
-	var statusCmd string
-	if m.commandMode {
-		statusCmd = CommandStyle.Render(fmt.Sprintf(":%s", m.commandBuf)) + lipgloss.NewStyle().Reverse(true).Render(" ")
-	}
-
-	statusContent := statusConnected + userInfo
-	if statusCmd != "" {
-		statusContent = statusCmd
-	}
-
-	padLen := m.width - lipgloss.Width(statusContent) - lipgloss.Width(statusRight) - 4
-	if padLen < 0 {
-		padLen = 0
-	}
-
-	statusBar := StatusBarStyle.Width(m.width).Render(
-		" " + statusContent + strings.Repeat(" ", padLen) + statusRight + " ",
+	return lipgloss.JoinVertical(lipgloss.Left,
+		topBar,
+		mainArea,
+		modeLine,
+		inputLine,
+		statusBar,
 	)
+}
 
-	return lipgloss.JoinVertical(lipgloss.Left, main, statusBar)
+func (m AppModel) renderTopBar() string {
+	left := " " + AppNameStyle.Render("cgram") + " " + SubtitleStyle.Render("v1.0.0")
+	right := TopBarHintStyle.Render(":help  Tab:switch  :q")
+
+	pad := m.width - lipgloss.Width(left) - lipgloss.Width(right) - 1
+	if pad < 0 {
+		pad = 0
+	}
+
+	content := left + strings.Repeat(" ", pad) + right + " "
+	return TopBarStyle.Width(m.width).Render(content)
+}
+
+func (m AppModel) renderModeLine() string {
+	var badge string
+	var hints string
+
+	switch m.mode {
+	case modeNormal:
+		badge = ModeNormalBadge.Render("-- NORMAL --")
+		hints = ModeHintStyle.Render("  i:insert | a:append | ::command")
+	case modeInsert:
+		badge = ModeInsertBadge.Render("-- INSERT --")
+		hints = ModeHintStyle.Render("  Esc:normal | Enter:send | Alt+Enter:newline")
+	case modeCommand:
+		badge = ModeCommandBadge.Render("-- COMMAND --")
+		cmdText := CommandStyle.Render(":" + m.commandBuf)
+		cursor := lipgloss.NewStyle().Reverse(true).Render(" ")
+		hints = "  " + cmdText + cursor
+	}
+
+	return badge + hints
+}
+
+func (m AppModel) renderInputLine(totalW int) string {
+	prompt := PromptStyle.Render("$ ")
+
+	if m.mode != modeInsert {
+		placeholder := InputPlaceholderStyle.Render("Press 'i' to insert")
+		colInfo := ColStyle.Render("col: 1")
+		left := prompt + placeholder
+		pad := totalW - lipgloss.Width(left) - lipgloss.Width(colInfo)
+		if pad < 0 {
+			pad = 0
+		}
+		return left + strings.Repeat(" ", pad) + colInfo
+	}
+
+	inputView := m.input.View()
+	colInfo := ColStyle.Render(fmt.Sprintf("col: %d", m.input.CursorCol()))
+	left := prompt + inputView
+	pad := totalW - lipgloss.Width(left) - lipgloss.Width(colInfo)
+	if pad < 0 {
+		pad = 0
+	}
+	return left + strings.Repeat(" ", pad) + colInfo
+}
+
+func (m AppModel) renderStatusBar() string {
+	// Mode badge
+	var modeBadge string
+	switch m.mode {
+	case modeNormal:
+		modeBadge = StatusNormalBadge.Render("NORMAL")
+	case modeInsert:
+		modeBadge = StatusInsertBadge.Render("INSERT")
+	case modeCommand:
+		modeBadge = StatusCommandBadge.Render("COMMAND")
+	}
+
+	// Chat info
+	chatInfo := ""
+	if m.chat.ContactID() != "" {
+		chatInfo = "  " + SubtitleStyle.Render("chat:") + " " +
+			ChatHeaderNameStyle.Render("@"+m.chat.ContactName()) +
+			" " + SubtitleStyle.Render(fmt.Sprintf("[%d]", m.chat.MessageCount()))
+	}
+
+	// Pane indicators
+	contactsPane := StatusPaneDimStyle.Render("[1:contacts]")
+	chatPane := StatusPaneDimStyle.Render("[2:chat]")
+	inputPane := StatusPaneDimStyle.Render("[3:input]")
+	if m.focus == focusContacts {
+		contactsPane = StatusPaneActiveStyle.Render("[1:contacts]")
+	} else if m.focus == focusChat {
+		chatPane = StatusPaneActiveStyle.Render("[2:chat]")
+	}
+	if m.mode == modeInsert {
+		inputPane = StatusPaneActiveStyle.Render("[3:input]")
+	}
+	panes := "  " + contactsPane + " " + chatPane + " " + inputPane
+
+	// Connection + e2e + time
+	connStatus := StatusConnectedStyle.Render("● connected")
+	if !m.client.Connected() {
+		connStatus = StatusDisconnectedStyle.Render("● disconnected")
+	}
+	e2e := StatusE2EStyle.Render("■ e2e")
+	clock := SubtitleStyle.Render(time.Now().Format("15:04:05"))
+	right := "  " + connStatus + "  " + e2e + "  " + clock
+
+	left := modeBadge + chatInfo + panes
+
+	pad := m.width - lipgloss.Width(left) - lipgloss.Width(right) - 2
+	if pad < 0 {
+		pad = 0
+	}
+
+	content := " " + left + strings.Repeat(" ", pad) + right + " "
+	return StatusBarStyle.Width(m.width).Render(content)
 }
 
 func (m AppModel) waitForMessage() tea.Cmd {
