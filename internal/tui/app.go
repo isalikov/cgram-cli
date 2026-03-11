@@ -70,6 +70,9 @@ type AppModel struct {
 
 	authUsername string
 	authPassword string
+
+	// Pending auto-login (loaded from session file, waiting for connection)
+	pendingAutoLogin *autoLoginMsg
 }
 
 // Messages
@@ -228,15 +231,29 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case autoLoginMsg:
-		// Saved session found — auto-login
+		// Saved session found — store it and wait for connection
 		if m.screen == screenWelcome && msg.store != nil {
-			m.welcome.SetLoading(true)
-			return m, m.doAutoLogin(msg.store, msg.identity, msg.username, msg.password)
+			m.pendingAutoLogin = &msg
+			m.welcome.SetAutoLogin(true)
+			// If already connected, fire immediately
+			if m.client.Connected() {
+				al := m.pendingAutoLogin
+				m.pendingAutoLogin = nil
+				return m, m.doAutoLogin(al.store, al.identity, al.username, al.password)
+			}
 		}
 
 	case connectedMsg:
 		m.welcome.SetConnected(true)
 		m.wasConnected = true
+		// Trigger pending auto-login now that we're connected
+		if m.pendingAutoLogin != nil && m.screen == screenWelcome {
+			al := m.pendingAutoLogin
+			m.pendingAutoLogin = nil
+			cmds = append(cmds, m.waitForStatus())
+			cmds = append(cmds, m.doAutoLogin(al.store, al.identity, al.username, al.password))
+			return m, tea.Batch(cmds...)
+		}
 		if m.authUsername != "" && m.authPassword != "" && m.store != nil {
 			cmds = append(cmds, m.reAuthCmd())
 		}
@@ -291,6 +308,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case authErrorMsg:
 		m.welcome.SetLoading(false)
+		m.welcome.SetAutoLogin(false)
 		m.welcome.SetError(msg.err)
 
 	case contactsUpdatedMsg:
@@ -482,6 +500,29 @@ func (m *AppModel) executeCommand(cmd string) tea.Cmd {
 			m.store.Close()
 		}
 		return tea.Quit
+
+	case "logout":
+		// Clear saved session and return to welcome screen
+		os.Remove(filepath.Join(m.dataDir, "session"))
+		if m.identity != nil {
+			m.identity.AuthPassword = ""
+			if m.store != nil {
+				m.store.SaveIdentity(m.identity)
+			}
+		}
+		if m.store != nil {
+			m.store.Close()
+		}
+		m.store = nil
+		m.identity = nil
+		m.authUsername = ""
+		m.authPassword = ""
+		m.screen = screenWelcome
+		m.welcome = NewWelcome(m.serverAddr, m.client.Connected())
+		m.welcome.SetSize(m.width, m.height)
+		m.chat.SetContact("", "")
+		m.contacts.SetContacts(nil)
+		return nil
 
 	case "help":
 		m.showHelp = true

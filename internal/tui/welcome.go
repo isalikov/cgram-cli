@@ -34,6 +34,7 @@ type WelcomeModel struct {
 	connected  bool
 	err        string
 	loading    bool
+	autoLogin  bool
 	width      int
 	height     int
 }
@@ -116,6 +117,7 @@ func (m *WelcomeModel) SetConnected(c bool)  { m.connected = c }
 func (m *WelcomeModel) SetError(e string)     { m.err = e }
 func (m *WelcomeModel) SetSize(w, h int)      { m.width = w; m.height = h }
 func (m *WelcomeModel) SetLoading(l bool)     { m.loading = l }
+func (m *WelcomeModel) SetAutoLogin(a bool)   { m.autoLogin = a }
 func (m *WelcomeModel) Username() string      { return m.username.Value() }
 func (m *WelcomeModel) Password() string      { return m.password.Value() }
 
@@ -176,6 +178,21 @@ func (m WelcomeModel) View() string {
 		Render(info)
 
 	header := lipgloss.JoinHorizontal(lipgloss.Top, logo.String(), infoBlock)
+
+	// Auto-login preloader — show only logo + status
+	if m.autoLogin {
+		status := SubtitleStyle.Render("Connecting...")
+		if m.connected {
+			status = SubtitleStyle.Render("Authenticating...")
+		}
+		content := lipgloss.JoinVertical(lipgloss.Center,
+			header,
+			"",
+			"",
+			status,
+		)
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, content)
+	}
 
 	// Form
 	usernameField := InputFieldStyle

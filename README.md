@@ -33,6 +33,12 @@ brew tap isalikov/tap
 brew install cgram
 ```
 
+For better notification experience on macOS, install `terminal-notifier`:
+
+```bash
+brew install terminal-notifier
+```
+
 ### macOS (manual)
 
 ```bash

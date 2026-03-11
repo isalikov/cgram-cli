@@ -20,11 +20,11 @@ build:
 	go build -o ./bin/cgram ./cmd/cgram
 
 install: build
-	install -d $(PREFIX)/bin
-	install -m 755 ./bin/cgram $(PREFIX)/bin/cgram
+	sudo install -d $(PREFIX)/bin
+	sudo install -m 755 ./bin/cgram $(PREFIX)/bin/cgram
 
 uninstall:
-	rm -f $(PREFIX)/bin/cgram
+	sudo rm -f $(PREFIX)/bin/cgram
 
 run:
 	go run ./cmd/cgram

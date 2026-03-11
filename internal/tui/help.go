@@ -20,6 +20,7 @@ var helpEntries = []helpEntry{
 	{":add <username>", "Add contact by username"},
 	{":rename <name>", "Rename selected contact"},
 	{":delete", "Delete selected contact"},
+	{":logout", "Logout and return to login screen"},
 	{":quit, :q", "Quit application"},
 	{":help", "Show this help"},
 	{"Esc", "Close overlay / exit command mode"},
