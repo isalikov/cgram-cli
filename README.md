@@ -14,6 +14,85 @@ Built with [Bubble Tea](https://github.com/charmbracelet/bubbletea) and the [Nor
 - Auto-reconnect on connection loss
 - Nord dark theme
 
+## Ecosystem
+
+| Repository | Description |
+|---|---|
+| [cgram-proto](https://github.com/isalikov/cgram-proto) | Protobuf schema definitions |
+| [cgram-server](https://github.com/isalikov/cgram-server) | Stateless relay server |
+| **cgram-cli** | Terminal client (this repo) |
+
+The server acts as a stateless relay — it never sees message content. All encryption and decryption happens client-side.
+
+## Installation
+
+### Download binary
+
+Prebuilt binaries for all platforms are available on the [Releases](https://github.com/isalikov/cgram-cli/releases) page:
+
+| Platform | Binary |
+|---|---|
+| Linux x86_64 | `cgram-linux-amd64` |
+| Linux ARM64 | `cgram-linux-arm64` |
+| macOS Intel | `cgram-darwin-amd64` |
+| macOS Apple Silicon | `cgram-darwin-arm64` |
+| Windows x86_64 | `cgram-windows-amd64.exe` |
+
+```bash
+# Example: macOS Apple Silicon
+curl -LO https://github.com/isalikov/cgram-cli/releases/latest/download/cgram-darwin-arm64
+chmod +x cgram-darwin-arm64
+./cgram-darwin-arm64
+```
+
+### Docker
+
+```bash
+docker run -it ghcr.io/isalikov/cgram-cli:latest
+```
+
+### Build from source
+
+```bash
+git clone https://github.com/isalikov/cgram-cli.git
+cd cgram-cli
+make build
+./bin/cgram
+```
+
+## Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `SERVER_ADDR` | `127.0.0.1:8080` | Server WebSocket address |
+| `DATA_DIR` | `~/.cgram` | Local data directory |
+
+Configuration is loaded from environment variables or a `.env` file in the working directory.
+
+## Keyboard Shortcuts
+
+| Key | Action |
+|---|---|
+| `Tab` | Switch between contacts and chat |
+| `j/k`, `Up/Down` | Navigate contacts / scroll messages |
+| `Enter` | Open chat / send message |
+| `Shift+Enter` | New line in message |
+| `:` | Command mode |
+| `?` | Help overlay |
+| `Esc` | Close overlay |
+| `Ctrl+C` | Quit |
+
+### Commands
+
+| Command | Description |
+|---|---|
+| `:add <username>` | Add a contact |
+| `:rename <name>` | Rename selected contact |
+| `:delete` | Delete selected contact (`:delete!` to confirm) |
+| `:id` | Show your user ID |
+| `:help` | Show help |
+| `:quit` / `:q` | Quit |
+
 ## Architecture
 
 ```
@@ -40,95 +119,34 @@ cgram-cli/
 └── .github/workflows/release.yml
 ```
 
-## Ecosystem
-
-| Repository | Description |
-|---|---|
-| [cgram-proto](https://github.com/isalikov/cgram-proto) | Protobuf schema definitions |
-| [cgram-server](https://github.com/isalikov/cgram-server) | Stateless relay server |
-| **cgram-cli** | Terminal client (this repo) |
-
-The server acts as a stateless relay — it never sees message content. All encryption and decryption happens client-side.
-
-## Quick Start
-
-### Prerequisites
-
-- Go 1.22+
-- Running cgram-server instance
-
-### Installation
-
-```bash
-git clone https://github.com/isalikov/cgram-cli.git
-cd cgram-cli
-cp .env.example .env
-make build
-./bin/cgram
-```
-
-### Development
-
-```bash
-make dev
-```
-
-## Environment Variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `SERVER_ADDR` | `127.0.0.1:8080` | Server WebSocket address |
-| `DB_PATH` | `cgram.db` | SQLite database path |
-
-## Keyboard Shortcuts
-
-| Key | Action |
-|---|---|
-| `Tab` | Switch between contacts and chat |
-| `j/k`, `Up/Down` | Navigate contacts / scroll messages |
-| `Enter` | Open chat / send message |
-| `Shift+Enter` | New line in message |
-| `:` | Command mode |
-| `?` | Help overlay |
-| `Esc` | Close overlay |
-| `Ctrl+C` | Quit |
-
-### Commands
-
-| Command | Description |
-|---|---|
-| `:add <user_id>` | Add a contact |
-| `:delete` | Delete selected contact |
-| `:quit` / `:q` | Quit application |
-| `:help` | Show help |
-
 ## Protocol
 
-Communication uses WebSocket with binary Protobuf frames. Each frame is a `Frame` message containing a `request_id` for request-response correlation and a `payload` oneof with typed messages for auth, messaging, and key exchange.
+Communication uses WebSocket with binary Protobuf frames. Each frame contains a `request_id` for request-response correlation and a `payload` oneof with typed messages.
 
-### Authentication Flow
+### Authentication
 
 1. **Register** — sends username, password verifier, Ed25519 public key
 2. **Login** — sends username, auth message; receives session token
 3. **Upload pre-keys** — sends X3DH pre-key bundle for key exchange
 
-### Message Flow
+### Messaging
 
 1. Sender fetches recipient's pre-key bundle
 2. X3DH key agreement derives a shared secret
-3. Message payload encrypted with NaCl secretbox
+3. Message encrypted with NaCl secretbox (XSalsa20 + Poly1305)
 4. Encrypted envelope sent via server relay
 5. Recipient decrypts using shared secret + ratchet index
 
-## Development Commands
+## Development
 
 ```
 make build    Build binary to ./bin/cgram
-make run      Run without building (go run)
+make run      Run without building
 make dev      Run with .env loaded
 make clean    Remove ./bin directory
 make test     Run tests
-make help     Show this help
+make vendor   Download dependencies to vendor/
+make help     Show available targets
 ```
 
 ## License
