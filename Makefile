@@ -1,19 +1,30 @@
-.PHONY: build run dev clean test vendor help
+PREFIX ?= /usr/local
+
+.PHONY: build install uninstall run dev clean test vendor help
 
 help:
 	@echo "Usage: make [target]"
 	@echo ""
 	@echo "Targets:"
-	@echo "  build    Build binary to ./bin/cgram"
-	@echo "  run      Run without building (go run)"
-	@echo "  dev      Run with .env loaded"
-	@echo "  clean    Remove ./bin directory"
-	@echo "  test     Run tests"
-	@echo "  vendor   Download dependencies to vendor/"
-	@echo "  help     Show this help"
+	@echo "  build      Build binary to ./bin/cgram"
+	@echo "  install    Build and install to $(PREFIX)/bin/cgram"
+	@echo "  uninstall  Remove from $(PREFIX)/bin/cgram"
+	@echo "  run        Run without building (go run)"
+	@echo "  dev        Run with .env loaded"
+	@echo "  clean      Remove ./bin directory"
+	@echo "  test       Run tests"
+	@echo "  vendor     Download dependencies to vendor/"
+	@echo "  help       Show this help"
 
 build:
 	go build -o ./bin/cgram ./cmd/cgram
+
+install: build
+	install -d $(PREFIX)/bin
+	install -m 755 ./bin/cgram $(PREFIX)/bin/cgram
+
+uninstall:
+	rm -f $(PREFIX)/bin/cgram
 
 run:
 	go run ./cmd/cgram

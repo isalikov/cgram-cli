@@ -74,9 +74,10 @@ docker run -it ghcr.io/isalikov/cgram-cli:latest
 ```bash
 git clone https://github.com/isalikov/cgram-cli.git
 cd cgram-cli
-make build
-./bin/cgram
+make install
 ```
+
+This builds and installs `cgram` to `/usr/local/bin/`. To remove: `make uninstall`.
 
 ## Configuration
 
@@ -158,13 +159,15 @@ Communication uses WebSocket with binary Protobuf frames. Each frame contains a 
 ## Development
 
 ```
-make build    Build binary to ./bin/cgram
-make run      Run without building
-make dev      Run with .env loaded
-make clean    Remove ./bin directory
-make test     Run tests
-make vendor   Download dependencies to vendor/
-make help     Show available targets
+make build      Build binary to ./bin/cgram
+make install    Build and install to /usr/local/bin/cgram
+make uninstall  Remove from /usr/local/bin/cgram
+make run        Run without building
+make dev        Run with .env loaded
+make clean      Remove ./bin directory
+make test       Run tests
+make vendor     Download dependencies to vendor/
+make help       Show available targets
 ```
 
 ## License
