@@ -1,39 +1,8 @@
-# Binaries
-/bin/
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
 cgram
-
-# Test
-*.test
-coverage.out
-coverage.html
-
-# Vendor
-/vendor/
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Debug
-__debug_bin*
-
-# Temporary
-*.tmp
-*.log
-
-# Database
 *.db
-*.db-wal
 *.db-shm
+*.db-wal
+*.key
+.env
+.idea/
+~/

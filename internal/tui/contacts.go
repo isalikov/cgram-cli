@@ -4,178 +4,247 @@ import (
 	"fmt"
 	"strings"
 
+	pb "github.com/isalikov/cgram-proto/gen/proto"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/isalikov/cgram-cli/internal/store"
 )
 
-type ContactsModel struct {
-	contacts []store.Contact
-	selected int
-	focused  bool
-	width    int
-	height   int
-	offset   int
+type ContactEntry struct {
+	UserID   string
+	Username string
+	Online   bool
+	Unread   int
 }
 
-func NewContacts() ContactsModel {
+type ContactsModel struct {
+	contacts []ContactEntry
+	cursor   int
+	filter   string
+	width    int
+	height   int
+}
+
+func NewContactsModel() ContactsModel {
 	return ContactsModel{}
 }
 
-func (m *ContactsModel) SetContacts(c []store.Contact) {
-	m.contacts = c
-	if m.selected >= len(c) {
-		m.selected = max(0, len(c)-1)
+func (m *ContactsModel) SetSize(w, h int) {
+	m.width = w
+	m.height = h
+}
+
+func (m *ContactsModel) SetContacts(contacts []*pb.Contact) {
+	m.contacts = make([]ContactEntry, len(contacts))
+	for i, c := range contacts {
+		m.contacts[i] = ContactEntry{
+			UserID:   c.UserId,
+			Username: c.Username,
+			Online:   c.Online,
+		}
+	}
+	// Preserve unread counts
+}
+
+func (m *ContactsModel) UpdatePresence(userID string, online bool) {
+	for i := range m.contacts {
+		if m.contacts[i].UserID == userID {
+			m.contacts[i].Online = online
+			return
+		}
 	}
 }
-func (m *ContactsModel) SetFocused(f bool)  { m.focused = f }
-func (m *ContactsModel) SetSize(w, h int)   { m.width = w; m.height = h }
-func (m ContactsModel) SelectedContact() *store.Contact {
-	if len(m.contacts) == 0 {
-		return nil
+
+func (m *ContactsModel) AddContact(userID, username string, online bool) {
+	// Check if already exists
+	for i := range m.contacts {
+		if m.contacts[i].UserID == userID {
+			m.contacts[i].Username = username
+			m.contacts[i].Online = online
+			return
+		}
 	}
-	return &m.contacts[m.selected]
+	m.contacts = append(m.contacts, ContactEntry{
+		UserID:   userID,
+		Username: username,
+		Online:   online,
+	})
+}
+
+func (m *ContactsModel) RemoveContact(userID string) {
+	for i := range m.contacts {
+		if m.contacts[i].UserID == userID {
+			m.contacts = append(m.contacts[:i], m.contacts[i+1:]...)
+			if m.cursor >= len(m.filtered()) && m.cursor > 0 {
+				m.cursor--
+			}
+			return
+		}
+	}
+}
+
+func (m *ContactsModel) IncrementUnread(userID string) {
+	for i := range m.contacts {
+		if m.contacts[i].UserID == userID {
+			m.contacts[i].Unread++
+			return
+		}
+	}
+}
+
+func (m *ContactsModel) ClearUnread(userID string) {
+	for i := range m.contacts {
+		if m.contacts[i].UserID == userID {
+			m.contacts[i].Unread = 0
+			return
+		}
+	}
+}
+
+func (m *ContactsModel) SetFilter(f string) {
+	m.filter = f
+	if m.cursor >= len(m.filtered()) {
+		m.cursor = 0
+	}
+}
+
+func (m *ContactsModel) filtered() []ContactEntry {
+	if m.filter == "" {
+		return m.contacts
+	}
+	var result []ContactEntry
+	query := strings.ToLower(m.filter)
+	for _, c := range m.contacts {
+		if strings.Contains(strings.ToLower(c.Username), query) {
+			result = append(result, c)
+		}
+	}
+	return result
 }
 
 func (m *ContactsModel) MoveUp() {
-	if m.selected > 0 {
-		m.selected--
-		m.ensureVisible()
+	if m.cursor > 0 {
+		m.cursor--
 	}
 }
 
 func (m *ContactsModel) MoveDown() {
-	if m.selected < len(m.contacts)-1 {
-		m.selected++
-		m.ensureVisible()
+	filtered := m.filtered()
+	if m.cursor < len(filtered)-1 {
+		m.cursor++
 	}
 }
 
-func (m *ContactsModel) ensureVisible() {
-	visible := m.visibleRows()
-	if m.selected < m.offset {
-		m.offset = m.selected
+func (m *ContactsModel) Selected() *ContactEntry {
+	filtered := m.filtered()
+	if len(filtered) == 0 {
+		return nil
 	}
-	if m.selected >= m.offset+visible {
-		m.offset = m.selected - visible + 1
+	if m.cursor >= len(filtered) {
+		m.cursor = 0
 	}
+	return &filtered[m.cursor]
 }
 
-func (m ContactsModel) visibleRows() int {
-	// height minus header(1) and footer hint(1)
-	v := m.height - 2
-	if v < 1 {
-		v = 1
-	}
-	return v
-}
-
-func (m ContactsModel) View() string {
-	w := m.width
-
-	// Header: CONTACTS  [N]
-	header := ContactsHeaderStyle.Render("CONTACTS") + "  " +
-		ContactCountStyle.Render(fmt.Sprintf("[%d]", len(m.contacts)))
-	header = padRight(header, w)
-
-	if len(m.contacts) == 0 {
-		var lines []string
-		lines = append(lines, header)
-		lines = append(lines, "")
-		lines = append(lines, ContactHintStyle.Render("  No contacts yet"))
-		lines = append(lines, ContactHintStyle.Render("  :add <username>"))
-		// Pad to height
-		for len(lines) < m.height {
-			lines = append(lines, "")
+func (m *ContactsModel) FindByUsername(username string) *ContactEntry {
+	query := strings.ToLower(username)
+	for i := range m.contacts {
+		if strings.ToLower(m.contacts[i].Username) == query {
+			return &m.contacts[i]
 		}
-		return strings.Join(lines[:m.height], "\n")
 	}
-
-	visible := m.visibleRows()
-
-	end := m.offset + visible
-	if end > len(m.contacts) {
-		end = len(m.contacts)
-	}
-
-	var lines []string
-	lines = append(lines, header)
-
-	for i := m.offset; i < end; i++ {
-		c := m.contacts[i]
-		lines = append(lines, m.renderContact(c, i == m.selected, w))
-	}
-
-	// Pad middle
-	for len(lines) < m.height-1 {
-		lines = append(lines, "")
-	}
-
-	// Footer hint
-	hint := ContactHintStyle.Render("j/k:nav") +
-		strings.Repeat(" ", max(1, w-20)) +
-		ContactHintStyle.Render("Enter:sel")
-	lines = append(lines, hint)
-
-	if len(lines) > m.height {
-		lines = lines[:m.height]
-	}
-
-	return strings.Join(lines, "\n")
-}
-
-func (m ContactsModel) renderContact(c store.Contact, selected bool, width int) string {
-	// Selector
-	sel := "  "
-	if selected {
-		sel = "> "
-	}
-
-	// Status dot
-	dot := IdleDotStyle.Render("· ")
-	if c.Online {
-		dot = OnlineDotStyle.Render("● ")
-	}
-
-	// Name
-	name := c.Name
-	if name == "" {
-		name = c.UserID[:8]
-	}
-
-	// Unread badge
-	badge := ""
-	if c.Unread > 0 {
-		badge = UnreadBadge.Render(fmt.Sprintf("[%d]", c.Unread))
-	}
-
-	// Build left and right parts
-	left := sel + dot + name
-	right := badge
-
-	// Calculate padding between name and badge
-	pad := width - lipgloss.Width(left) - lipgloss.Width(right)
-	if pad < 1 {
-		pad = 1
-	}
-
-	line := left + strings.Repeat(" ", pad) + right
-
-	if selected {
-		nameStyled := sel + dot + SelectedContactStyle.Render(name)
-		pad = width - lipgloss.Width(nameStyled) - lipgloss.Width(right)
-		if pad < 1 {
-			pad = 1
+	// Partial match
+	for i := range m.contacts {
+		if strings.Contains(strings.ToLower(m.contacts[i].Username), query) {
+			return &m.contacts[i]
 		}
-		line = nameStyled + strings.Repeat(" ", pad) + right
 	}
-
-	return line
+	return nil
 }
 
-func padRight(s string, w int) string {
-	pad := w - lipgloss.Width(s)
-	if pad > 0 {
-		return s + strings.Repeat(" ", pad)
+func (m *ContactsModel) Count() int {
+	return len(m.contacts)
+}
+
+func (m *ContactsModel) OnlineCount() int {
+	count := 0
+	for _, c := range m.contacts {
+		if c.Online {
+			count++
+		}
 	}
-	return s
+	return count
+}
+
+func (m *ContactsModel) View(active bool) string {
+	filtered := m.filtered()
+
+	var b strings.Builder
+
+	// Header
+	title := " contacts"
+	if m.filter != "" {
+		title = fmt.Sprintf(" /%s", m.filter)
+	}
+	titleStyle := headerStyle.Width(m.width)
+	b.WriteString(titleStyle.Render(title))
+	b.WriteString("\n")
+
+	if len(filtered) == 0 {
+		if len(m.contacts) == 0 {
+			b.WriteString(infoStyle.Render("  no contacts yet"))
+			b.WriteString("\n")
+			b.WriteString(infoStyle.Render("  :add <username>"))
+		} else {
+			b.WriteString(infoStyle.Render("  no matches"))
+		}
+		return lipgloss.NewStyle().Width(m.width).Height(m.height).Render(b.String())
+	}
+
+	// Calculate visible range
+	maxVisible := m.height - 2 // -1 for header, -1 for padding
+	if maxVisible < 1 {
+		maxVisible = 1
+	}
+
+	startIdx := 0
+	if m.cursor >= maxVisible {
+		startIdx = m.cursor - maxVisible + 1
+	}
+	endIdx := startIdx + maxVisible
+	if endIdx > len(filtered) {
+		endIdx = len(filtered)
+	}
+
+	for i := startIdx; i < endIdx; i++ {
+		c := filtered[i]
+
+		// Status dot
+		dot := offlineDotStyle.Render("●")
+		if c.Online {
+			dot = onlineDotStyle.Render("●")
+		}
+
+		// Username
+		name := c.Username
+
+		// Unread badge
+		badge := ""
+		if c.Unread > 0 {
+			badge = " " + unreadBadgeStyle.Render(fmt.Sprintf(" %d ", c.Unread))
+		}
+
+		line := fmt.Sprintf(" %s %s%s", dot, name, badge)
+
+		if i == m.cursor && active {
+			line = contactSelectedStyle.Width(m.width).Render(line)
+		} else {
+			line = contactNormalStyle.Width(m.width).Render(line)
+		}
+
+		b.WriteString(line)
+		if i < endIdx-1 {
+			b.WriteString("\n")
+		}
+	}
+
+	return lipgloss.NewStyle().Width(m.width).Height(m.height).Render(b.String())
 }

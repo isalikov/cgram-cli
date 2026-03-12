@@ -2,298 +2,133 @@ package tui
 
 import "github.com/charmbracelet/lipgloss"
 
-// Nord palette
+// Nord color palette
 var (
 	// Polar Night
-	Nord0 = lipgloss.Color("#2E3440")
-	Nord1 = lipgloss.Color("#3B4252")
-	Nord2 = lipgloss.Color("#434C5E")
-	Nord3 = lipgloss.Color("#4C566A")
+	nord0 = lipgloss.Color("#2E3440")
+	nord1 = lipgloss.Color("#3B4252")
+	nord2 = lipgloss.Color("#434C5E")
+	nord3 = lipgloss.Color("#4C566A")
 
 	// Snow Storm
-	Nord4 = lipgloss.Color("#D8DEE9")
-	Nord5 = lipgloss.Color("#E5E9F0")
-	Nord6 = lipgloss.Color("#ECEFF4")
+	nord4 = lipgloss.Color("#D8DEE9")
+	nord5 = lipgloss.Color("#E5E9F0")
+	nord6 = lipgloss.Color("#ECEFF4")
 
 	// Frost
-	Nord7  = lipgloss.Color("#8FBCBB")
-	Nord8  = lipgloss.Color("#88C0D0")
-	Nord9  = lipgloss.Color("#81A1C1")
-	Nord10 = lipgloss.Color("#5E81AC")
+	nord7  = lipgloss.Color("#8FBCBB")
+	nord8  = lipgloss.Color("#88C0D0")
+	nord9  = lipgloss.Color("#81A1C1")
+	nord10 = lipgloss.Color("#5E81AC")
 
 	// Aurora
-	Nord11 = lipgloss.Color("#BF616A") // red
-	Nord12 = lipgloss.Color("#D08770") // orange
-	Nord13 = lipgloss.Color("#EBCB8B") // yellow
-	Nord14 = lipgloss.Color("#A3BE8C") // green
-	Nord15 = lipgloss.Color("#B48EAD") // purple
-
-	// Logo gradient colors
-	LogoColors = []lipgloss.Color{
-		lipgloss.Color("#5E81AC"),
-		lipgloss.Color("#81A1C1"),
-		lipgloss.Color("#88C0D0"),
-		lipgloss.Color("#A3BE8C"),
-		lipgloss.Color("#EBCB8B"),
-		lipgloss.Color("#D08770"),
-	}
+	nord11 = lipgloss.Color("#BF616A") // red
+	nord12 = lipgloss.Color("#D08770") // orange
+	nord13 = lipgloss.Color("#EBCB8B") // yellow
+	nord14 = lipgloss.Color("#A3BE8C") // green
+	nord15 = lipgloss.Color("#B48EAD") // purple
 )
 
-// Common styles (kept for welcome, help, notification)
 var (
-	BaseBorder = lipgloss.Border{
-		Top:         "─",
-		Bottom:      "─",
-		Left:        "│",
-		Right:       "│",
-		TopLeft:     "┌",
-		TopRight:    "┐",
-		BottomLeft:  "└",
-		BottomRight: "┘",
-	}
+	// Panel styles
+	contactsPanelStyle = lipgloss.NewStyle().
+		Background(nord0).
+		Padding(0, 1)
 
-	PanelStyle = lipgloss.NewStyle().
-			Border(BaseBorder).
-			BorderForeground(Nord3)
+	contactsPanelActiveStyle = lipgloss.NewStyle().
+		Background(nord0).
+		BorderStyle(lipgloss.NormalBorder()).
+		BorderForeground(nord9).
+		BorderLeft(true).
+		BorderRight(true).
+		Padding(0, 1)
 
-	ActivePanelStyle = lipgloss.NewStyle().
-				Border(BaseBorder).
-				BorderForeground(Nord14)
+	chatPanelStyle = lipgloss.NewStyle().
+		Background(nord0).
+		Padding(0, 1)
 
-	TitleStyle = lipgloss.NewStyle().
-			Foreground(Nord14).
-			Bold(true)
+	// Contact list
+	contactSelectedStyle = lipgloss.NewStyle().
+		Foreground(nord6).
+		Background(nord2).
+		Bold(true).
+		Padding(0, 1)
 
-	SubtitleStyle = lipgloss.NewStyle().
-			Foreground(Nord3)
+	contactNormalStyle = lipgloss.NewStyle().
+		Foreground(nord4).
+		Padding(0, 1)
 
-	LabelStyle = lipgloss.NewStyle().
-			Foreground(Nord3)
+	onlineDotStyle  = lipgloss.NewStyle().Foreground(nord14)
+	offlineDotStyle = lipgloss.NewStyle().Foreground(nord3)
 
-	ValueStyle = lipgloss.NewStyle().
-			Foreground(Nord6)
+	unreadBadgeStyle = lipgloss.NewStyle().
+		Foreground(nord0).
+		Background(nord13).
+		Bold(true).
+		Padding(0, 1)
 
-	OnlineStyle = lipgloss.NewStyle().
-			Foreground(Nord14)
+	// Messages
+	myMessageStyle = lipgloss.NewStyle().
+		Foreground(nord6).
+		Background(nord10).
+		Padding(0, 1).
+		MarginLeft(2)
 
-	OfflineStyle = lipgloss.NewStyle().
-			Foreground(Nord11)
+	theirMessageStyle = lipgloss.NewStyle().
+		Foreground(nord6).
+		Background(nord2).
+		Padding(0, 1).
+		MarginRight(2)
 
-	SelectedStyle = lipgloss.NewStyle().
-			Background(Nord2).
-			Foreground(Nord6)
+	messageSenderStyle = lipgloss.NewStyle().
+		Foreground(nord8).
+		Bold(true)
 
-	UnreadBadge = lipgloss.NewStyle().
-			Foreground(Nord13).
-			Bold(true)
+	messageTimeStyle = lipgloss.NewStyle().
+		Foreground(nord3)
 
-	MyMessageStyle = lipgloss.NewStyle().
-			Foreground(Nord9)
+	// Status bar
+	statusBarStyle = lipgloss.NewStyle().
+		Background(nord1).
+		Foreground(nord4).
+		Padding(0, 1)
 
-	TheirMessageStyle = lipgloss.NewStyle().
-				Foreground(Nord14)
+	statusBarKeyStyle = lipgloss.NewStyle().
+		Foreground(nord8).
+		Bold(true)
 
-	TimestampStyle = lipgloss.NewStyle().
-			Foreground(Nord3)
+	statusBarSepStyle = lipgloss.NewStyle().
+		Foreground(nord3)
 
-	InputStyle = lipgloss.NewStyle().
-			Border(lipgloss.Border{Top: "─"}).
-			BorderForeground(Nord3)
+	// Input
+	inputStyle = lipgloss.NewStyle().
+		Background(nord0).
+		Foreground(nord6).
+		Padding(0, 1)
 
-	StatusBarStyle = lipgloss.NewStyle().
-			Foreground(Nord3).
-			Background(Nord1).
-			Padding(0, 1)
+	inputPromptStyle = lipgloss.NewStyle().
+		Foreground(nord9).
+		Bold(true)
 
-	CommandStyle = lipgloss.NewStyle().
-			Foreground(Nord13)
+	// Header
+	headerStyle = lipgloss.NewStyle().
+		Background(nord1).
+		Foreground(nord8).
+		Bold(true).
+		Padding(0, 1)
 
-	ErrorStyle = lipgloss.NewStyle().
-			Foreground(Nord11)
+	// Notification / status messages
+	infoStyle = lipgloss.NewStyle().
+		Foreground(nord8)
 
-	SuccessStyle = lipgloss.NewStyle().
-			Foreground(Nord14)
+	errorStyle = lipgloss.NewStyle().
+		Foreground(nord11)
 
-	HelpKeyStyle = lipgloss.NewStyle().
-			Foreground(Nord14).
-			Bold(true)
+	successStyle = lipgloss.NewStyle().
+		Foreground(nord14)
 
-	HelpDescStyle = lipgloss.NewStyle().
-			Foreground(Nord4)
-
-	PlaceholderStyle = lipgloss.NewStyle().
-				Foreground(Nord3)
-
-	InputFieldStyle = lipgloss.NewStyle().
-			Border(BaseBorder).
-			BorderForeground(Nord3).
-			Padding(0, 1)
-
-	ActiveInputFieldStyle = lipgloss.NewStyle().
-				Border(BaseBorder).
-				BorderForeground(Nord14).
-				Padding(0, 1)
-
-	ButtonStyle = lipgloss.NewStyle().
-			Foreground(Nord0).
-			Background(Nord14).
-			Padding(0, 3).
-			Bold(true)
-
-	InactiveButtonStyle = lipgloss.NewStyle().
-				Foreground(Nord4).
-				Background(Nord2).
-				Padding(0, 3)
-
-	ToastStyle = lipgloss.NewStyle().
-			Border(BaseBorder).
-			BorderForeground(Nord14).
-			Background(Nord1).
-			Foreground(Nord6).
-			Padding(0, 2)
-
-	ToastErrorStyle = lipgloss.NewStyle().
-			Border(BaseBorder).
-			BorderForeground(Nord11).
-			Background(Nord1).
-			Foreground(Nord11).
-			Padding(0, 2)
-)
-
-// ── New styles for redesigned UI ──
-
-var (
-	// Top bar
-	TopBarStyle = lipgloss.NewStyle().
-			Background(Nord1).
-			Foreground(Nord4)
-
-	AppNameStyle = lipgloss.NewStyle().
-			Foreground(Nord14).
-			Bold(true)
-
-	TopBarHintStyle = lipgloss.NewStyle().
-			Foreground(Nord3)
-
-	// Separator between panels
-	SeparatorStyle = lipgloss.NewStyle().
-			Foreground(Nord3)
-
-	// Contacts panel
-	ContactsHeaderStyle = lipgloss.NewStyle().
-				Foreground(Nord14).
-				Bold(true)
-
-	ContactCountStyle = lipgloss.NewStyle().
-				Foreground(Nord3)
-
-	ContactNameStyle = lipgloss.NewStyle().
-				Foreground(Nord4)
-
-	SelectedContactStyle = lipgloss.NewStyle().
-				Foreground(Nord14).
-				Bold(true)
-
-	OnlineDotStyle = lipgloss.NewStyle().
-			Foreground(Nord14)
-
-	OfflineDotStyle = lipgloss.NewStyle().
-			Foreground(Nord11)
-
-	IdleDotStyle = lipgloss.NewStyle().
-			Foreground(Nord3)
-
-	ContactHintStyle = lipgloss.NewStyle().
-				Foreground(Nord3)
-
-	// Chat header
-	ChatHeaderNameStyle = lipgloss.NewStyle().
-				Foreground(Nord14).
-				Bold(true)
-
-	ChatHeaderStatusStyle = lipgloss.NewStyle().
-				Foreground(Nord14)
-
-	ChatHeaderDimStyle = lipgloss.NewStyle().
-				Foreground(Nord3)
-
-	// Bubble borders
-	BubbleBorderStyle = lipgloss.NewStyle().
-				Foreground(Nord14)
-
-	BubbleTextStyle = lipgloss.NewStyle().
-			Foreground(Nord4)
-
-	// Names in bubbles
-	TheirNameStyle = lipgloss.NewStyle().
-			Foreground(Nord14)
-
-	MyNameStyle = lipgloss.NewStyle().
-			Foreground(Nord7)
-
-	// Chat separators (top/bottom rounded lines)
-	ChatSeparatorStyle = lipgloss.NewStyle().
-				Foreground(Nord3)
-
-	// Mode line
-	ModeNormalBadge = lipgloss.NewStyle().
-			Foreground(Nord14).
-			Bold(true)
-
-	ModeInsertBadge = lipgloss.NewStyle().
-			Foreground(Nord14).
-			Bold(true)
-
-	ModeCommandBadge = lipgloss.NewStyle().
-			Foreground(Nord13).
-			Bold(true)
-
-	ModeHintStyle = lipgloss.NewStyle().
-			Foreground(Nord3)
-
-	// Input line
-	PromptStyle = lipgloss.NewStyle().
-			Foreground(Nord14).
-			Bold(true)
-
-	InputPlaceholderStyle = lipgloss.NewStyle().
-				Foreground(Nord3)
-
-	ColStyle = lipgloss.NewStyle().
-			Foreground(Nord3)
-
-	// Status bar badges
-	StatusNormalBadge = lipgloss.NewStyle().
-				Foreground(Nord0).
-				Background(Nord14).
-				Bold(true).
-				Padding(0, 1)
-
-	StatusInsertBadge = lipgloss.NewStyle().
-				Foreground(Nord0).
-				Background(Nord14).
-				Bold(true).
-				Padding(0, 1)
-
-	StatusCommandBadge = lipgloss.NewStyle().
-				Foreground(Nord0).
-				Background(Nord13).
-				Bold(true).
-				Padding(0, 1)
-
-	StatusConnectedStyle = lipgloss.NewStyle().
-				Foreground(Nord14)
-
-	StatusDisconnectedStyle = lipgloss.NewStyle().
-				Foreground(Nord11)
-
-	StatusE2EStyle = lipgloss.NewStyle().
-			Foreground(Nord13)
-
-	StatusPaneActiveStyle = lipgloss.NewStyle().
-				Foreground(Nord6).
-				Bold(true)
-
-	StatusPaneDimStyle = lipgloss.NewStyle().
-				Foreground(Nord3)
+	// Encryption indicator
+	encryptionStyle = lipgloss.NewStyle().
+		Foreground(nord14).
+		Bold(true)
 )

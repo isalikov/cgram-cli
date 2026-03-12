@@ -3,8 +3,13 @@ package client
 import (
 	"context"
 	"fmt"
+	"log"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"crypto/rand"
+	"encoding/hex"
 
 	pb "github.com/isalikov/cgram-proto/gen/proto"
 	"google.golang.org/protobuf/proto"
@@ -12,225 +17,383 @@ import (
 )
 
 type Client struct {
-	addr string
+	url  string
 	conn *websocket.Conn
 	mu   sync.Mutex
 
-	connected bool
+	// Request-response correlation
+	pending sync.Map // requestID -> chan *pb.Frame
 
-	// Incoming holds pushed frames (envelopes, etc.) for the TUI to consume.
-	Incoming chan *pb.Frame
+	// Server-push channel for incoming envelopes, presence events, etc.
+	Push chan *pb.Frame
 
-	// Status receives connection state changes (true=connected, false=disconnected).
-	Status chan bool
+	// done is closed when readLoop exits; never closed again on reconnect.
+	// Consumers check this to know when the connection dropped.
+	done      chan struct{}
+	doneMu    sync.Mutex
 
-	pending   map[string]chan *pb.Frame
-	pendingMu sync.Mutex
-
-	ctx    context.Context
-	cancel context.CancelFunc
-
-	onReconnect func()
+	connected atomic.Bool
+	ctx       context.Context
+	cancel    context.CancelFunc
 }
 
-func New(addr string) *Client {
+func New(url string) *Client {
 	return &Client{
-		addr:     addr,
-		Incoming: make(chan *pb.Frame, 64),
-		Status:   make(chan bool, 8),
-		pending:  make(map[string]chan *pb.Frame),
+		url:  url,
+		Push: make(chan *pb.Frame, 256),
+		done: make(chan struct{}),
 	}
 }
 
-func (c *Client) OnReconnect(fn func()) { c.onReconnect = fn }
+func (c *Client) Connect(ctx context.Context) error {
+	c.ctx, c.cancel = context.WithCancel(ctx)
 
-func (c *Client) Connected() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.connected
-}
-
-func (c *Client) Connect(parentCtx context.Context) error {
-	c.ctx, c.cancel = context.WithCancel(parentCtx)
-
-	url := fmt.Sprintf("ws://%s/ws", c.addr)
-	conn, _, err := websocket.Dial(c.ctx, url, nil)
+	conn, _, err := websocket.Dial(c.ctx, c.url, nil)
 	if err != nil {
-		// Start background reconnect so the app can recover
-		go c.reconnect()
-		return fmt.Errorf("dial: %w", err)
+		return fmt.Errorf("connect: %w", err)
 	}
+	conn.SetReadLimit(64 * 1024)
 
 	c.mu.Lock()
 	c.conn = conn
-	c.connected = true
 	c.mu.Unlock()
+	c.connected.Store(true)
+
+	// Reset done channel for this connection
+	c.doneMu.Lock()
+	c.done = make(chan struct{})
+	c.doneMu.Unlock()
 
 	go c.readLoop()
 	return nil
 }
 
 func (c *Client) Close() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if c.cancel != nil {
 		c.cancel()
 	}
+	c.mu.Lock()
 	if c.conn != nil {
 		c.conn.Close(websocket.StatusNormalClosure, "bye")
-		c.conn = nil
 	}
-	c.connected = false
+	c.mu.Unlock()
+}
+
+func (c *Client) IsConnected() bool {
+	return c.connected.Load()
+}
+
+// Done returns a channel that is closed when the current connection's readLoop exits.
+func (c *Client) Done() <-chan struct{} {
+	c.doneMu.Lock()
+	defer c.doneMu.Unlock()
+	return c.done
+}
+
+func (c *Client) Send(frame *pb.Frame) error {
+	data, err := proto.Marshal(frame)
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.conn == nil {
+		return fmt.Errorf("not connected")
+	}
+	return c.conn.Write(c.ctx, websocket.MessageBinary, data)
+}
+
+// SendAndWait sends a frame and waits for a correlated response.
+func (c *Client) SendAndWait(ctx context.Context, frame *pb.Frame) (*pb.Frame, error) {
+	if frame.RequestId == "" {
+		frame.RequestId = generateRequestID()
+	}
+
+	ch := make(chan *pb.Frame, 1)
+	c.pending.Store(frame.RequestId, ch)
+	defer c.pending.Delete(frame.RequestId)
+
+	if err := c.Send(frame); err != nil {
+		return nil, err
+	}
+
+	select {
+	case resp := <-ch:
+		return resp, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func (c *Client) readLoop() {
+	defer func() {
+		c.connected.Store(false)
+		// Signal that this connection is dead. Do NOT close c.Push —
+		// it survives across reconnections.
+		c.doneMu.Lock()
+		close(c.done)
+		c.doneMu.Unlock()
+	}()
+
 	for {
 		_, data, err := c.conn.Read(c.ctx)
 		if err != nil {
-			c.mu.Lock()
-			c.connected = false
-			c.conn = nil
-			c.mu.Unlock()
-
-			// Notify TUI of disconnect
-			select {
-			case c.Status <- false:
-			default:
+			if c.ctx.Err() != nil {
+				return
 			}
-
-			c.reconnect()
+			log.Printf("read error: %v", err)
 			return
 		}
 
 		frame := &pb.Frame{}
 		if err := proto.Unmarshal(data, frame); err != nil {
+			log.Printf("unmarshal error: %v", err)
 			continue
 		}
 
 		// Check if this is a response to a pending request
 		if frame.RequestId != "" {
-			c.pendingMu.Lock()
-			ch, ok := c.pending[frame.RequestId]
-			if ok {
-				delete(c.pending, frame.RequestId)
-				c.pendingMu.Unlock()
-				ch <- frame
+			if ch, ok := c.pending.LoadAndDelete(frame.RequestId); ok {
+				ch.(chan *pb.Frame) <- frame
 				continue
 			}
-			c.pendingMu.Unlock()
 		}
 
-		// Push message (envelope, etc.) to the TUI
+		// Server-push message
 		select {
-		case c.Incoming <- frame:
+		case c.Push <- frame:
 		default:
-			// drop if buffer full
+			log.Printf("push channel full, dropping frame")
 		}
 	}
 }
 
-func (c *Client) reconnect() {
-	for {
-		select {
-		case <-c.ctx.Done():
-			return
-		case <-time.After(3 * time.Second):
+// Login sends login request and returns session token.
+func (c *Client) Login(ctx context.Context, username string, password []byte) (string, error) {
+	resp, err := c.SendAndWait(ctx, &pb.Frame{
+		Payload: &pb.Frame_LoginRequest{LoginRequest: &pb.LoginRequest{
+			Username:    username,
+			AuthMessage: password,
+		}},
+	})
+	if err != nil {
+		return "", err
+	}
+
+	switch p := resp.Payload.(type) {
+	case *pb.Frame_LoginResponse:
+		return p.LoginResponse.SessionToken, nil
+	case *pb.Frame_Error:
+		return "", fmt.Errorf("%s", p.Error.Message)
+	default:
+		return "", fmt.Errorf("unexpected response")
+	}
+}
+
+// Register sends registration request and returns user ID.
+func (c *Client) Register(ctx context.Context, username string, password []byte, identityKey []byte) (string, error) {
+	resp, err := c.SendAndWait(ctx, &pb.Frame{
+		Payload: &pb.Frame_RegisterRequest{RegisterRequest: &pb.RegisterRequest{
+			Username:          username,
+			PasswordVerifier:  password,
+			PublicIdentityKey: identityKey,
+		}},
+	})
+	if err != nil {
+		return "", err
+	}
+
+	switch p := resp.Payload.(type) {
+	case *pb.Frame_RegisterResponse:
+		return p.RegisterResponse.UserId, nil
+	case *pb.Frame_Error:
+		return "", fmt.Errorf("%s", p.Error.Message)
+	default:
+		return "", fmt.Errorf("unexpected response")
+	}
+}
+
+// ListContacts fetches the contact list from the server.
+func (c *Client) ListContacts(ctx context.Context) ([]*pb.Contact, error) {
+	resp, err := c.SendAndWait(ctx, &pb.Frame{
+		Payload: &pb.Frame_ListContactsRequest{ListContactsRequest: &pb.ListContactsRequest{}},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	switch p := resp.Payload.(type) {
+	case *pb.Frame_ListContactsResponse:
+		return p.ListContactsResponse.Contacts, nil
+	case *pb.Frame_Error:
+		return nil, fmt.Errorf("%s", p.Error.Message)
+	default:
+		return nil, fmt.Errorf("unexpected response")
+	}
+}
+
+// AddContact adds a contact by username.
+func (c *Client) AddContact(ctx context.Context, username string) (*pb.AddContactResponse, error) {
+	resp, err := c.SendAndWait(ctx, &pb.Frame{
+		Payload: &pb.Frame_AddContactRequest{AddContactRequest: &pb.AddContactRequest{
+			Username: username,
+		}},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	switch p := resp.Payload.(type) {
+	case *pb.Frame_AddContactResponse:
+		return p.AddContactResponse, nil
+	case *pb.Frame_Error:
+		return nil, fmt.Errorf("%s", p.Error.Message)
+	default:
+		return nil, fmt.Errorf("unexpected response")
+	}
+}
+
+// RemoveContact removes a contact by user ID.
+func (c *Client) RemoveContact(ctx context.Context, userID string) error {
+	resp, err := c.SendAndWait(ctx, &pb.Frame{
+		Payload: &pb.Frame_RemoveContactRequest{RemoveContactRequest: &pb.RemoveContactRequest{
+			UserId: userID,
+		}},
+	})
+	if err != nil {
+		return err
+	}
+
+	switch p := resp.Payload.(type) {
+	case *pb.Frame_RemoveContactResponse:
+		_ = p
+		return nil
+	case *pb.Frame_Error:
+		return fmt.Errorf("%s", p.Error.Message)
+	default:
+		return fmt.Errorf("unexpected response")
+	}
+}
+
+// GetStats fetches server statistics.
+func (c *Client) GetStats(ctx context.Context) (*pb.StatsResponse, error) {
+	resp, err := c.SendAndWait(ctx, &pb.Frame{
+		Payload: &pb.Frame_StatsRequest{StatsRequest: &pb.StatsRequest{}},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	switch p := resp.Payload.(type) {
+	case *pb.Frame_StatsResponse:
+		return p.StatsResponse, nil
+	case *pb.Frame_Error:
+		return nil, fmt.Errorf("%s", p.Error.Message)
+	default:
+		return nil, fmt.Errorf("unexpected response")
+	}
+}
+
+// SendEnvelope sends an encrypted envelope.
+func (c *Client) SendEnvelope(ctx context.Context, env *pb.Envelope) error {
+	resp, err := c.SendAndWait(ctx, &pb.Frame{
+		Payload: &pb.Frame_Envelope{Envelope: env},
+	})
+	if err != nil {
+		return err
+	}
+
+	switch p := resp.Payload.(type) {
+	case *pb.Frame_Ack:
+		_ = p
+		return nil
+	case *pb.Frame_Error:
+		return fmt.Errorf("%s", p.Error.Message)
+	default:
+		return fmt.Errorf("unexpected response")
+	}
+}
+
+// FetchPreKey fetches a user's pre-key bundle.
+func (c *Client) FetchPreKey(ctx context.Context, userID string) (*pb.FetchPreKeyResponse, error) {
+	resp, err := c.SendAndWait(ctx, &pb.Frame{
+		Payload: &pb.Frame_FetchPreKeyRequest{FetchPreKeyRequest: &pb.FetchPreKeyRequest{
+			UserId: userID,
+		}},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	switch p := resp.Payload.(type) {
+	case *pb.Frame_FetchPreKeyResponse:
+		return p.FetchPreKeyResponse, nil
+	case *pb.Frame_Error:
+		return nil, fmt.Errorf("%s", p.Error.Message)
+	default:
+		return nil, fmt.Errorf("unexpected response")
+	}
+}
+
+// UploadPreKeys uploads pre-key bundle to server.
+func (c *Client) UploadPreKeys(ctx context.Context, bundle *pb.PreKeyBundle) error {
+	resp, err := c.SendAndWait(ctx, &pb.Frame{
+		Payload: &pb.Frame_UploadPreKeysRequest{UploadPreKeysRequest: &pb.UploadPreKeysRequest{
+			Bundle: bundle,
+		}},
+	})
+	if err != nil {
+		return err
+	}
+
+	switch p := resp.Payload.(type) {
+	case *pb.Frame_UploadPreKeysResponse:
+		_ = p
+		return nil
+	case *pb.Frame_Error:
+		return fmt.Errorf("%s", p.Error.Message)
+	default:
+		return fmt.Errorf("unexpected response")
+	}
+}
+
+func generateRequestID() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// WaitForPush blocks until a push message arrives or the connection drops.
+// Returns nil if the connection was closed.
+func (c *Client) WaitForPush() *pb.Frame {
+	done := c.Done()
+	select {
+	case frame := <-c.Push:
+		return frame
+	case <-done:
+		return nil
+	}
+}
+
+// ReconnectLoop attempts to reconnect with exponential backoff.
+func (c *Client) ReconnectLoop(ctx context.Context) error {
+	delays := []time.Duration{1, 2, 4, 8, 16, 30}
+	for i := 0; ; i++ {
+		delay := delays[len(delays)-1]
+		if i < len(delays) {
+			delay = delays[i]
 		}
 
-		url := fmt.Sprintf("ws://%s/ws", c.addr)
-		conn, _, err := websocket.Dial(c.ctx, url, nil)
-		if err != nil {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay * time.Second):
+		}
+
+		if err := c.Connect(ctx); err != nil {
+			log.Printf("reconnect attempt %d failed: %v", i+1, err)
 			continue
 		}
-
-		c.mu.Lock()
-		c.conn = conn
-		c.connected = true
-		c.mu.Unlock()
-
-		// Notify TUI of reconnect
-		select {
-		case c.Status <- true:
-		default:
-		}
-
-		if c.onReconnect != nil {
-			c.onReconnect()
-		}
-
-		go c.readLoop()
-		return
+		return nil
 	}
-}
-
-// Send sends a frame and waits for a response with matching request_id.
-func (c *Client) Send(ctx context.Context, frame *pb.Frame) (*pb.Frame, error) {
-	c.mu.Lock()
-	conn := c.conn
-	c.mu.Unlock()
-
-	if conn == nil {
-		return nil, fmt.Errorf("not connected")
-	}
-
-	// Register pending response channel
-	ch := make(chan *pb.Frame, 1)
-	c.pendingMu.Lock()
-	c.pending[frame.RequestId] = ch
-	c.pendingMu.Unlock()
-
-	data, err := proto.Marshal(frame)
-	if err != nil {
-		c.pendingMu.Lock()
-		delete(c.pending, frame.RequestId)
-		c.pendingMu.Unlock()
-		return nil, fmt.Errorf("marshal: %w", err)
-	}
-
-	err = conn.Write(ctx, websocket.MessageBinary, data)
-	if err != nil {
-		c.pendingMu.Lock()
-		delete(c.pending, frame.RequestId)
-		c.pendingMu.Unlock()
-		return nil, fmt.Errorf("write: %w", err)
-	}
-
-	// Wait for response with timeout
-	select {
-	case resp := <-ch:
-		// Check for error response
-		if errPayload, ok := resp.Payload.(*pb.Frame_Error); ok {
-			return resp, fmt.Errorf("server error %d: %s", errPayload.Error.Code, errPayload.Error.Message)
-		}
-		return resp, nil
-	case <-ctx.Done():
-		c.pendingMu.Lock()
-		delete(c.pending, frame.RequestId)
-		c.pendingMu.Unlock()
-		return nil, ctx.Err()
-	case <-time.After(10 * time.Second):
-		c.pendingMu.Lock()
-		delete(c.pending, frame.RequestId)
-		c.pendingMu.Unlock()
-		return nil, fmt.Errorf("request timeout")
-	}
-}
-
-// SendFire sends a frame without waiting for a response.
-func (c *Client) SendFire(ctx context.Context, frame *pb.Frame) error {
-	c.mu.Lock()
-	conn := c.conn
-	c.mu.Unlock()
-
-	if conn == nil {
-		return fmt.Errorf("not connected")
-	}
-
-	data, err := proto.Marshal(frame)
-	if err != nil {
-		return fmt.Errorf("marshal: %w", err)
-	}
-
-	return conn.Write(ctx, websocket.MessageBinary, data)
 }

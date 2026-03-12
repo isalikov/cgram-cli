@@ -3,1218 +3,702 @@ package tui
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
+	pb "github.com/isalikov/cgram-proto/gen/proto"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/google/uuid"
-	pb "github.com/isalikov/cgram-proto/gen/proto"
+
 	"github.com/isalikov/cgram-cli/internal/client"
 	"github.com/isalikov/cgram-cli/internal/crypto"
-	"github.com/isalikov/cgram-cli/internal/notify"
 	"github.com/isalikov/cgram-cli/internal/store"
-	"google.golang.org/protobuf/proto"
 )
-
-type screen int
 
 const (
-	screenWelcome screen = iota
-	screenMain
+	panelContacts = iota
+	panelChat
 )
-
-type focus int
 
 const (
-	focusContacts focus = iota
-	focusChat
+	contactsWidthPct = 25 // percentage of screen
+	minContactsWidth = 20
+	maxContactsWidth = 40
 )
-
-type inputMode int
-
-const (
-	modeNormal inputMode = iota
-	modeInsert
-	modeCommand
-)
-
-type SendMessageMsg struct {
-	ContactID string
-	Content   string
-}
-
-type AppModel struct {
-	screen     screen
-	focus      focus
-	mode       inputMode
-	welcome    WelcomeModel
-	contacts   ContactsModel
-	chat       ChatModel
-	input      InputModel
-	toast      *Toast
-	showHelp   bool
-	commandBuf string
-	width      int
-	height     int
-
-	client   *client.Client
-	store    *store.Store
-	identity *store.Identity
-
-	dataDir      string
-	serverAddr   string
-	wasConnected bool
-
-	authUsername string
-	authPassword string
-
-	// Pending auto-login (loaded from session file, waiting for connection)
-	pendingAutoLogin *autoLoginMsg
-}
 
 // Messages
-type connectedMsg struct{}
-type disconnectedMsg struct{}
-type incomingFrameMsg struct{ frame *pb.Frame }
-type authSuccessMsg struct {
-	store    *store.Store
-	identity *store.Identity
-	token    string
-	username string
-	password string
-}
-type authErrorMsg struct{ err string }
-type contactsUpdatedMsg struct{}
-type messagesUpdatedMsg struct{}
-type addContactResultMsg struct {
-	userID   string
-	username string
-	err      string
-}
-type sendErrorMsg struct{ err string }
-
-func NewApp(cl *client.Client, dataDir string, serverAddr string) AppModel {
-	return AppModel{
-		screen:     screenWelcome,
-		mode:       modeNormal,
-		client:     cl,
-		dataDir:    dataDir,
-		serverAddr: serverAddr,
-		welcome:    NewWelcome(serverAddr, cl.Connected()),
-		contacts:   NewContacts(),
-		chat:       NewChat(),
-		input:      NewInput("Type a message..."),
+type (
+	tickMsg           time.Time
+	pushFrameMsg      *pb.Frame
+	contactsLoadedMsg []*pb.Contact
+	statsLoadedMsg    *pb.StatsResponse
+	messageSentMsg    store.Message
+	reconnectedMsg    struct{}
+	disconnectedMsg   struct{}
+	statusMsg         struct {
+		text    string
+		isError bool
 	}
+)
+
+type AppModel struct {
+	client   *client.Client
+	store    *store.Store
+	identity *crypto.KeyPair
+	username string
+	platform string
+
+	contacts  ContactsModel
+	chat      ChatModel
+	statusBar StatusBarModel
+
+	activePanel int
+	textInput   textinput.Model
+	filterMode  bool // true when typing /query to filter contacts
+
+	// Confirm mode for destructive actions
+	confirmAction string // description of pending action
+	confirmCmd    tea.Cmd
+
+	statusText    string
+	statusIsError bool
+	statusExpiry  time.Time
+
+	width  int
+	height int
+	ready  bool
 }
 
-type autoLoginMsg struct {
-	store    *store.Store
-	identity *store.Identity
-	username string
-	password string
+func NewApp(c *client.Client, s *store.Store, identity *crypto.KeyPair, username, platform string) AppModel {
+	ti := textinput.New()
+	ti.Focus()
+	ti.Prompt = "> "
+	ti.PromptStyle = inputPromptStyle
+	ti.TextStyle = lipgloss.NewStyle().Foreground(nord6)
+	ti.Cursor.Style = lipgloss.NewStyle().Foreground(nord9)
+	ti.CharLimit = 4096
+
+	return AppModel{
+		client:    c,
+		store:     s,
+		identity:  identity,
+		username:  username,
+		platform:  platform,
+		contacts:  NewContactsModel(),
+		chat:      NewChatModel(username),
+		statusBar: NewStatusBarModel(username, platform),
+		textInput: ti,
+	}
 }
 
 func (m AppModel) Init() tea.Cmd {
 	return tea.Batch(
-		tea.WindowSize(),
-		m.connectCmd(),
-		m.waitForStatus(),
-		m.tryAutoLogin(),
+		m.loadContacts,
+		m.loadStats,
+		m.waitForPush,
+		m.tickEverySecond,
+		m.watchConnection,
+		textinput.Blink,
 	)
 }
 
-func (m AppModel) tryAutoLogin() tea.Cmd {
-	dataDir := m.dataDir
-	return func() tea.Msg {
-		sessionFile := filepath.Join(dataDir, "session")
-		data, err := os.ReadFile(sessionFile)
-		if err != nil {
-			return nil
-		}
-		username := strings.TrimSpace(string(data))
-		if username == "" {
-			return nil
-		}
-		st, err := openStore(dataDir, username)
-		if err != nil {
-			return nil
-		}
-		identity, err := st.GetIdentity()
-		if err != nil || identity.AuthPassword == "" {
-			st.Close()
-			return nil
-		}
-		return autoLoginMsg{
-			store:    st,
-			identity: identity,
-			username: username,
-			password: identity.AuthPassword,
-		}
-	}
-}
-
-func saveSession(dataDir, username string) {
-	os.MkdirAll(dataDir, 0700)
-	os.WriteFile(filepath.Join(dataDir, "session"), []byte(username), 0600)
-}
-
-func (m AppModel) connectCmd() tea.Cmd {
-	cl := m.client
-	return func() tea.Msg {
-		ctx := context.Background()
-		if err := cl.Connect(ctx); err != nil {
-			return disconnectedMsg{}
-		}
-		return connectedMsg{}
-	}
-}
-
-func (m AppModel) waitForStatus() tea.Cmd {
-	ch := m.client.Status
-	return func() tea.Msg {
-		connected := <-ch
-		if connected {
-			return connectedMsg{}
-		}
-		return disconnectedMsg{}
-	}
-}
-
-func openStore(dataDir, username string) (*store.Store, error) {
-	if err := os.MkdirAll(dataDir, 0700); err != nil {
-		return nil, fmt.Errorf("create data dir: %w", err)
-	}
-	dbPath := filepath.Join(dataDir, username+".db")
-	return store.New(dbPath)
-}
-
 func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	var cmds []tea.Cmd
-
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m.welcome.SetSize(msg.Width, msg.Height)
+		m.ready = true
 		m.updateLayout()
+		m.textInput.Width = m.width - 4
 		return m, nil
 
 	case tea.KeyMsg:
-		// Global quit
-		if isKey(msg, "ctrl+c") {
-			if m.store != nil {
-				m.store.Close()
-			}
-			return m, tea.Quit
-		}
+		return m.handleKey(msg)
 
-		// Help overlay
-		if m.showHelp {
-			if isKey(msg, "esc") {
-				m.showHelp = false
-			}
-			return m, nil
-		}
+	case tickMsg:
+		return m, m.tickEverySecond
 
-		// Route by screen
-		switch m.screen {
-		case screenWelcome:
-			var cmd tea.Cmd
-			m.welcome, cmd = m.welcome.Update(msg)
-			cmds = append(cmds, cmd)
+	case pushFrameMsg:
+		return m.handlePush(msg)
 
-		case screenMain:
-			return m.updateMain(msg)
-		}
-
-	case autoLoginMsg:
-		// Saved session found — store it and wait for connection
-		if m.screen == screenWelcome && msg.store != nil {
-			m.pendingAutoLogin = &msg
-			m.welcome.SetAutoLogin(true)
-			// If already connected, fire immediately
-			if m.client.Connected() {
-				al := m.pendingAutoLogin
-				m.pendingAutoLogin = nil
-				return m, m.doAutoLogin(al.store, al.identity, al.username, al.password)
+	case contactsLoadedMsg:
+		m.contacts.SetContacts(msg)
+		m.statusBar.SetContactCount(m.contacts.Count())
+		for _, c := range msg {
+			if err := m.store.SaveContact(c.UserId, c.Username); err != nil {
+				// log error but continue
 			}
 		}
+		return m, nil
 
-	case connectedMsg:
-		m.welcome.SetConnected(true)
-		m.wasConnected = true
-		// Trigger pending auto-login now that we're connected
-		if m.pendingAutoLogin != nil && m.screen == screenWelcome {
-			al := m.pendingAutoLogin
-			m.pendingAutoLogin = nil
-			cmds = append(cmds, m.waitForStatus())
-			cmds = append(cmds, m.doAutoLogin(al.store, al.identity, al.username, al.password))
-			return m, tea.Batch(cmds...)
+	case statsLoadedMsg:
+		if msg != nil {
+			m.statusBar.SetStats(msg.TotalUsers, msg.OnlineUsers)
 		}
-		if m.authUsername != "" && m.authPassword != "" && m.store != nil {
-			cmds = append(cmds, m.reAuthCmd())
+		return m, nil
+
+	case messageSentMsg:
+		if m.chat.PeerID() == msg.PeerID {
+			m.chat.AddMessage(store.Message(msg))
 		}
-		cmds = append(cmds, m.waitForStatus())
+		return m, nil
 
 	case disconnectedMsg:
-		m.welcome.SetConnected(false)
-		if m.wasConnected {
-			go notify.ConnectionError("Lost connection to server")
-		}
-		cmds = append(cmds, m.waitForStatus())
-
-	case LoginMsg:
-		m.welcome.SetLoading(true)
-		return m, m.doLogin(msg.Username, msg.Password)
-
-	case RegisterMsg:
-		m.welcome.SetLoading(true)
-		return m, m.doRegister(msg.Username, msg.Password)
-
-	case authSuccessMsg:
-		m.welcome.SetLoading(false)
-		m.store = msg.store
-		m.identity = msg.identity
-		m.authUsername = msg.username
-		m.authPassword = msg.password
-		// Persist session
-		saveSession(m.dataDir, msg.username)
-		msg.identity.AuthPassword = msg.password
-		m.store.SaveIdentity(msg.identity)
-		m.screen = screenMain
-		m.focus = focusContacts
-		m.mode = modeNormal
-		m.updateFocus()
-		m.updateLayout()
-		cl := m.client
-		username := msg.username
-		password := msg.password
-		cl.OnReconnect(func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			cl.Send(ctx, &pb.Frame{
-				RequestId: uuid.NewString(),
-				Payload: &pb.Frame_LoginRequest{LoginRequest: &pb.LoginRequest{
-					Username:    username,
-					AuthMessage: []byte(password),
-				}},
-			})
-		})
-		toastCmd := m.showToast(fmt.Sprintf("Your ID: %s", msg.identity.UserID), false)
-		return m, tea.Batch(toastCmd, m.loadContactsCmd(), m.waitForMessage())
-
-	case authErrorMsg:
-		m.welcome.SetLoading(false)
-		m.welcome.SetAutoLogin(false)
-		m.welcome.SetError(msg.err)
-
-	case contactsUpdatedMsg:
-		if m.store != nil {
-			contacts, _ := m.store.ListContacts()
-			m.contacts.SetContacts(contacts)
-		}
-
-	case messagesUpdatedMsg:
-		if m.store != nil && m.chat.ContactID() != "" {
-			msgs, _ := m.store.GetMessages(m.chat.ContactID(), 500)
-			m.chat.SetMessages(msgs)
-		}
-
-	case addContactResultMsg:
-		if msg.err != "" {
-			cmds = append(cmds, m.showToast(msg.err, true))
-		} else {
-			m.store.AddContact(msg.userID, msg.username)
-			cmds = append(cmds, m.showToast(fmt.Sprintf("Added %s", msg.username), false))
-			cmds = append(cmds, m.loadContactsCmd())
-		}
-
-	case SendMessageMsg:
-		return m, m.sendMessageCmd(msg.ContactID, msg.Content)
-
-	case sendErrorMsg:
-		cmds = append(cmds, m.showToast("Failed to send: "+msg.err, true))
-
-	case incomingFrameMsg:
-		cmd := m.handleIncoming(msg.frame)
-		return m, tea.Batch(cmd, m.waitForMessage())
-
-	case dismissToastMsg:
-		m.toast = nil
-	}
-
-	return m, tea.Batch(cmds...)
-}
-
-// ── Vim mode routing ──
-
-func (m *AppModel) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch m.mode {
-	case modeNormal:
-		return m.updateNormal(msg)
-	case modeInsert:
-		return m.updateInsert(msg)
-	case modeCommand:
-		return m.updateCommand(msg)
-	}
-	return m, nil
-}
-
-func (m *AppModel) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch {
-	case isKey(msg, "i"):
-		m.mode = modeInsert
-		m.input.Focus()
-		return m, nil
-
-	case isKey(msg, "a"):
-		m.mode = modeInsert
-		m.input.Focus()
-		// Move cursor to end
-		row := len(m.input.lines) - 1
-		m.input.cursorRow = row
-		m.input.cursorCol = len(m.input.lines[row])
-		return m, nil
-
-	case isKey(msg, ":"):
-		m.mode = modeCommand
-		m.commandBuf = ""
-		return m, nil
-
-	case isKey(msg, "tab"):
-		if m.focus == focusContacts {
-			m.focus = focusChat
-		} else {
-			m.focus = focusContacts
-		}
-		m.updateFocus()
-		return m, nil
-
-	case isKey(msg, "j", "down"):
-		if m.focus == focusContacts {
-			m.contacts.MoveDown()
-		} else {
-			m.chat.ScrollDown(3)
-		}
-		return m, nil
-
-	case isKey(msg, "k", "up"):
-		if m.focus == focusContacts {
-			m.contacts.MoveUp()
-		} else {
-			m.chat.ScrollUp(3)
-		}
-		return m, nil
-
-	case isKey(msg, "pgup"):
-		m.chat.ScrollUp(10)
-		return m, nil
-
-	case isKey(msg, "pgdown"):
-		m.chat.ScrollDown(10)
-		return m, nil
-
-	case isKey(msg, "enter"):
-		if m.focus == focusContacts {
-			if c := m.contacts.SelectedContact(); c != nil {
-				m.openChat(c)
-			}
-		}
-		return m, nil
-
-	case isKey(msg, "esc"):
-		m.showHelp = false
-		return m, nil
-	}
-
-	return m, nil
-}
-
-func (m *AppModel) updateInsert(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch {
-	case isKey(msg, "esc"):
-		m.mode = modeNormal
-		m.input.Blur()
-		return m, nil
-
-	case isKey(msg, "alt+enter"):
-		m.input = m.input.InsertNewline()
-		return m, nil
-
-	case isKey(msg, "enter"):
-		content := strings.TrimSpace(m.input.Value())
-		if content != "" && m.chat.ContactID() != "" {
-			m.input.Reset()
-			return m, func() tea.Msg {
-				return SendMessageMsg{ContactID: m.chat.ContactID(), Content: content}
-			}
-		}
-		return m, nil
-
-	default:
-		m.input, _ = m.input.Update(msg)
-		return m, nil
-	}
-}
-
-func (m *AppModel) updateCommand(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch {
-	case isKey(msg, "esc"):
-		m.mode = modeNormal
-		m.commandBuf = ""
-		return m, nil
-	case isKey(msg, "enter"):
-		cmd := m.executeCommand(m.commandBuf)
-		m.mode = modeNormal
-		m.commandBuf = ""
-		return m, cmd
-	case isKey(msg, "backspace"):
-		if len(m.commandBuf) > 0 {
-			runes := []rune(m.commandBuf)
-			m.commandBuf = string(runes[:len(runes)-1])
-		}
-	default:
-		if msg.Type == tea.KeyRunes {
-			m.commandBuf += string(msg.Runes)
-		} else if msg.Type == tea.KeySpace {
-			m.commandBuf += " "
-		}
-	}
-	return m, nil
-}
-
-// ── Commands ──
-
-func (m *AppModel) executeCommand(cmd string) tea.Cmd {
-	parts := strings.Fields(cmd)
-	if len(parts) == 0 {
-		return nil
-	}
-
-	switch parts[0] {
-	case "quit", "q":
-		if m.store != nil {
-			m.store.Close()
-		}
-		return tea.Quit
-
-	case "logout":
-		// Clear saved session and return to welcome screen
-		os.Remove(filepath.Join(m.dataDir, "session"))
-		if m.identity != nil {
-			m.identity.AuthPassword = ""
-			if m.store != nil {
-				m.store.SaveIdentity(m.identity)
-			}
-		}
-		if m.store != nil {
-			m.store.Close()
-		}
-		m.store = nil
-		m.identity = nil
-		m.authUsername = ""
-		m.authPassword = ""
-		m.screen = screenWelcome
-		m.welcome = NewWelcome(m.serverAddr, m.client.Connected())
-		m.welcome.SetSize(m.width, m.height)
-		m.chat.SetContact("", "")
-		m.contacts.SetContacts(nil)
-		return nil
-
-	case "help":
-		m.showHelp = true
-		return nil
-
-	case "id":
-		if m.identity != nil && m.identity.UserID != "" {
-			return m.showToast(fmt.Sprintf("Your ID: %s", m.identity.UserID), false)
-		}
-		return m.showToast("Not logged in", true)
-
-	case "add":
-		if len(parts) < 2 {
-			return m.showToast("Usage: :add <username>", true)
-		}
-		if m.store == nil {
-			return m.showToast("Not logged in", true)
-		}
-		username := parts[1]
-		if m.identity != nil && username == m.identity.Username {
-			return m.showToast("Cannot add yourself as a contact", true)
-		}
-		cl := m.client
-		return tea.Batch(m.showToast(fmt.Sprintf("Resolving %s...", username), false), func() tea.Msg {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			resp, err := cl.Send(ctx, &pb.Frame{
-				RequestId: uuid.NewString(),
-				Payload:   &pb.Frame_ResolveUsernameRequest{ResolveUsernameRequest: &pb.ResolveUsernameRequest{Username: username}},
-			})
-			if err != nil {
-				return addContactResultMsg{err: fmt.Sprintf("User %s not found", username)}
-			}
-			rr, ok := resp.Payload.(*pb.Frame_ResolveUsernameResponse)
-			if !ok {
-				return addContactResultMsg{err: "unexpected response"}
-			}
-			return addContactResultMsg{userID: rr.ResolveUsernameResponse.UserId, username: username}
-		})
-
-	case "rename":
-		if len(parts) < 2 {
-			return m.showToast("Usage: :rename <new_name>", true)
-		}
-		if m.store == nil {
-			return m.showToast("Not logged in", true)
-		}
-		c := m.contacts.SelectedContact()
-		if c == nil {
-			return m.showToast("No contact selected", true)
-		}
-		newName := strings.Join(parts[1:], " ")
-		if err := m.store.RenameContact(c.UserID, newName); err != nil {
-			return m.showToast("Failed to rename contact", true)
-		}
-		if m.chat.ContactID() == c.UserID {
-			m.chat.SetContact(c.UserID, newName)
-		}
-		return tea.Batch(
-			m.showToast(fmt.Sprintf("Renamed to %s", newName), false),
-			func() tea.Msg { return contactsUpdatedMsg{} },
+		m.statusBar.SetConnected(false)
+		return m, tea.Batch(
+			m.setStatus("connection lost, reconnecting...", true),
+			m.reconnect,
 		)
 
-	case "delete", "delete!":
-		if m.store == nil {
-			return m.showToast("Not logged in", true)
-		}
-		c := m.contacts.SelectedContact()
-		if c == nil {
-			return m.showToast("No contact selected", true)
-		}
-		if err := m.store.DeleteContact(c.UserID); err != nil {
-			return m.showToast("Failed to delete contact", true)
-		}
-		m.chat.SetContact("", "")
-		return tea.Batch(
-			m.showToast(fmt.Sprintf("Deleted %s", c.Name), false),
-			func() tea.Msg { return contactsUpdatedMsg{} },
+	case reconnectedMsg:
+		m.statusBar.SetConnected(true)
+		return m, tea.Batch(
+			m.setStatus("reconnected", false),
+			m.waitForPush,
+			m.watchConnection,
+			m.loadContacts,
+			m.loadStats,
 		)
 
-	default:
-		return m.showToast(fmt.Sprintf("Unknown command: %s", parts[0]), true)
+	case statusMsg:
+		m.statusText = msg.text
+		m.statusIsError = msg.isError
+		m.statusExpiry = time.Now().Add(5 * time.Second)
+		return m, nil
 	}
+
+	// Pass through to textinput for cursor blink etc.
+	var cmd tea.Cmd
+	m.textInput, cmd = m.textInput.Update(msg)
+	return m, cmd
 }
-
-// ── Helpers ──
-
-func (m *AppModel) showToast(msg string, isErr bool) tea.Cmd {
-	m.toast = &Toast{Message: msg, IsError: isErr, ShowAt: time.Now()}
-	return toastTick()
-}
-
-func (m *AppModel) updateFocus() {
-	m.contacts.SetFocused(m.focus == focusContacts)
-	m.chat.SetFocused(m.focus == focusChat)
-}
-
-func (m *AppModel) updateLayout() {
-	if m.screen != screenMain {
-		return
-	}
-	contactsW := max(18, m.width/5)
-	// -1 for separator column
-	chatW := m.width - contactsW - 1
-	// height - topbar(1) - modeline(1) - inputline(1) - colline(1) - statusbar(1)
-	mainH := m.height - 5
-
-	m.contacts.SetSize(contactsW, mainH)
-	m.chat.SetSize(chatW, mainH)
-	m.input.SetWidth(chatW)
-}
-
-func (m *AppModel) openChat(c *store.Contact) {
-	m.chat.SetContact(c.UserID, c.Name)
-	if m.identity != nil {
-		m.chat.SetMyUsername(m.identity.Username)
-	}
-	if m.store != nil {
-		m.store.ClearUnread(c.UserID)
-		msgs, _ := m.store.GetMessages(c.UserID, 500)
-		m.chat.SetMessages(msgs)
-	}
-	m.focus = focusChat
-	m.updateFocus()
-}
-
-func (m AppModel) loadContactsCmd() tea.Cmd {
-	return func() tea.Msg {
-		return contactsUpdatedMsg{}
-	}
-}
-
-func (m AppModel) reAuthCmd() tea.Cmd {
-	cl := m.client
-	username := m.authUsername
-	password := m.authPassword
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		cl.Send(ctx, &pb.Frame{
-			RequestId: uuid.NewString(),
-			Payload: &pb.Frame_LoginRequest{LoginRequest: &pb.LoginRequest{
-				Username:    username,
-				AuthMessage: []byte(password),
-			}},
-		})
-		return nil
-	}
-}
-
-// ── Auth commands ──
-
-func (m AppModel) doAutoLogin(st *store.Store, identity *store.Identity, username, password string) tea.Cmd {
-	cl := m.client
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		resp, err := cl.Send(ctx, &pb.Frame{
-			RequestId: uuid.NewString(),
-			Payload: &pb.Frame_LoginRequest{LoginRequest: &pb.LoginRequest{
-				Username:    username,
-				AuthMessage: []byte(password),
-			}},
-		})
-		if err != nil {
-			st.Close()
-			return authErrorMsg{err: "Auto-login failed: " + err.Error()}
-		}
-
-		lr, ok := resp.Payload.(*pb.Frame_LoginResponse)
-		if !ok {
-			st.Close()
-			return authErrorMsg{err: "Auto-login failed"}
-		}
-
-		identity.SessionToken = lr.LoginResponse.SessionToken
-		st.SaveIdentity(identity)
-
-		return authSuccessMsg{store: st, identity: identity, token: lr.LoginResponse.SessionToken, username: username, password: password}
-	}
-}
-
-func (m AppModel) doRegister(username, password string) tea.Cmd {
-	cl := m.client
-	dataDir := m.dataDir
-	return func() tea.Msg {
-		if username == "" || password == "" {
-			return authErrorMsg{err: "username and password are required"}
-		}
-
-		st, err := openStore(dataDir, username)
-		if err != nil {
-			return authErrorMsg{err: fmt.Sprintf("database error: %v", err)}
-		}
-
-		edKey, err := crypto.GenerateEd25519()
-		if err != nil {
-			st.Close()
-			return authErrorMsg{err: "failed to generate keys"}
-		}
-
-		x25519Key, err := crypto.GenerateX25519()
-		if err != nil {
-			st.Close()
-			return authErrorMsg{err: "failed to generate keys"}
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		resp, err := cl.Send(ctx, &pb.Frame{
-			RequestId: uuid.NewString(),
-			Payload: &pb.Frame_RegisterRequest{RegisterRequest: &pb.RegisterRequest{
-				Username:         username,
-				PasswordVerifier: []byte(password),
-				PublicIdentityKey: edKey.Public,
-			}},
-		})
-		if err != nil {
-			st.Close()
-			return authErrorMsg{err: err.Error()}
-		}
-
-		rr, ok := resp.Payload.(*pb.Frame_RegisterResponse)
-		if !ok {
-			st.Close()
-			return authErrorMsg{err: "unexpected response"}
-		}
-
-		identity := &store.Identity{
-			UserID:         rr.RegisterResponse.UserId,
-			Username:       username,
-			Ed25519Private: edKey.Private,
-			Ed25519Public:  edKey.Public,
-			X25519Private:  x25519Key.Private,
-			X25519Public:   x25519Key.Public,
-		}
-
-		loginResp, err := cl.Send(ctx, &pb.Frame{
-			RequestId: uuid.NewString(),
-			Payload: &pb.Frame_LoginRequest{LoginRequest: &pb.LoginRequest{
-				Username:    username,
-				AuthMessage: []byte(password),
-			}},
-		})
-		if err != nil {
-			st.Close()
-			return authErrorMsg{err: err.Error()}
-		}
-
-		lr, ok := loginResp.Payload.(*pb.Frame_LoginResponse)
-		if !ok {
-			st.Close()
-			return authErrorMsg{err: "login failed after registration"}
-		}
-
-		identity.SessionToken = lr.LoginResponse.SessionToken
-		if err := st.SaveIdentity(identity); err != nil {
-			st.Close()
-			return authErrorMsg{err: "failed to save identity"}
-		}
-
-		spk, sig, otks, err := crypto.GeneratePreKeyBundle(edKey.Private, 10)
-		if err == nil {
-			oneTimeKeys := make([][]byte, len(otks))
-			for i, k := range otks {
-				oneTimeKeys[i] = k.Public
-			}
-			cl.Send(ctx, &pb.Frame{
-				RequestId: uuid.NewString(),
-				Payload: &pb.Frame_UploadPreKeysRequest{UploadPreKeysRequest: &pb.UploadPreKeysRequest{
-					Bundle: &pb.PreKeyBundle{
-						IdentityKey:          edKey.Public,
-						SignedPreKey:         spk.Public,
-						SignedPreKeySignature: sig,
-						OneTimePreKeys:       oneTimeKeys,
-					},
-				}},
-			})
-		}
-
-		return authSuccessMsg{store: st, identity: identity, token: lr.LoginResponse.SessionToken, username: username, password: password}
-	}
-}
-
-func (m AppModel) doLogin(username, password string) tea.Cmd {
-	cl := m.client
-	dataDir := m.dataDir
-	return func() tea.Msg {
-		if username == "" || password == "" {
-			return authErrorMsg{err: "username and password are required"}
-		}
-
-		st, err := openStore(dataDir, username)
-		if err != nil {
-			return authErrorMsg{err: fmt.Sprintf("database error: %v", err)}
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		resp, err := cl.Send(ctx, &pb.Frame{
-			RequestId: uuid.NewString(),
-			Payload: &pb.Frame_LoginRequest{LoginRequest: &pb.LoginRequest{
-				Username:    username,
-				AuthMessage: []byte(password),
-			}},
-		})
-		if err != nil {
-			st.Close()
-			return authErrorMsg{err: err.Error()}
-		}
-
-		lr, ok := resp.Payload.(*pb.Frame_LoginResponse)
-		if !ok {
-			st.Close()
-			return authErrorMsg{err: "unexpected response"}
-		}
-
-		identity, err := st.GetIdentity()
-		if err != nil {
-			st.Close()
-			return authErrorMsg{err: "No local identity found. Please register first."}
-		}
-
-		identity.Username = username
-		identity.SessionToken = lr.LoginResponse.SessionToken
-		st.SaveIdentity(identity)
-
-		return authSuccessMsg{store: st, identity: identity, token: lr.LoginResponse.SessionToken, username: username, password: password}
-	}
-}
-
-// ── Message handling ──
-
-func (m AppModel) sendMessageCmd(contactID, content string) tea.Cmd {
-	cl := m.client
-	st := m.store
-	identity := m.identity
-	return func() tea.Msg {
-		if st == nil {
-			return nil
-		}
-
-		msgID := uuid.NewString()
-		now := time.Now()
-
-		payload := &pb.MessagePayload{
-			MessageId: msgID,
-			SenderId:  "",
-			SentAt:    now.Unix(),
-			Content:   &pb.MessagePayload_Text{Text: &pb.TextMessage{Body: content}},
-		}
-
-		if identity != nil {
-			payload.SenderId = identity.UserID + ":" + identity.Username
-		}
-
-		payloadBytes, err := proto.Marshal(payload)
-		if err != nil {
-			return sendErrorMsg{err: "failed to encode message"}
-		}
-
-		ciphertext := payloadBytes
-		var ratchetIdx uint32
-
-		if cs, err := st.GetCryptoSession(contactID); err == nil {
-			ratchetIdx = cs.SendIndex
-			if encrypted, err := crypto.Encrypt(cs.SharedSecret, ratchetIdx, payloadBytes); err == nil {
-				ciphertext = encrypted
-				st.UpdateCryptoSessionSend(contactID, ratchetIdx+1)
-			}
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		_, err = cl.Send(ctx, &pb.Frame{
-			RequestId: uuid.NewString(),
-			Payload: &pb.Frame_Envelope{Envelope: &pb.Envelope{
-				RecipientId:  contactID,
-				Ciphertext:   ciphertext,
-				RatchetIndex: ratchetIdx,
-				Timestamp:    now.Unix(),
-			}},
-		})
-		if err != nil {
-			return sendErrorMsg{err: err.Error()}
-		}
-
-		st.SaveMessage(&store.Message{
-			ID:        msgID,
-			ContactID: contactID,
-			Content:   content,
-			IsMine:    true,
-			Timestamp: now,
-			Read:      true,
-		})
-
-		return messagesUpdatedMsg{}
-	}
-}
-
-func (m *AppModel) handleIncoming(frame *pb.Frame) tea.Cmd {
-	switch p := frame.Payload.(type) {
-	case *pb.Frame_Envelope:
-		return m.handleIncomingEnvelope(p.Envelope)
-	}
-	return nil
-}
-
-func (m *AppModel) handleIncomingEnvelope(env *pb.Envelope) tea.Cmd {
-	if m.store == nil {
-		return nil
-	}
-
-	var payload pb.MessagePayload
-	decrypted := false
-	senderID := ""
-
-	contacts, _ := m.store.ListContacts()
-	for _, c := range contacts {
-		if cs, err := m.store.GetCryptoSession(c.UserID); err == nil {
-			if pt, err := crypto.Decrypt(cs.SharedSecret, env.RatchetIndex, env.Ciphertext); err == nil {
-				if err := proto.Unmarshal(pt, &payload); err == nil {
-					decrypted = true
-					senderID = c.UserID
-					m.store.UpdateCryptoSessionRecv(c.UserID, env.RatchetIndex+1)
-					break
-				}
-			}
-		}
-	}
-
-	if !decrypted {
-		if err := proto.Unmarshal(env.Ciphertext, &payload); err == nil {
-			decrypted = true
-			senderID = payload.SenderId
-		}
-	}
-
-	if !decrypted {
-		return nil
-	}
-
-	// Parse "userId:username" format from SenderId
-	senderUsername := ""
-	if parts := strings.SplitN(senderID, ":", 2); len(parts) == 2 {
-		senderID = parts[0]
-		senderUsername = parts[1]
-	}
-
-	var content string
-	switch c := payload.Content.(type) {
-	case *pb.MessagePayload_Text:
-		content = c.Text.Body
-	case *pb.MessagePayload_File:
-		content = fmt.Sprintf("[File: %s]", c.File.Filename)
-	}
-
-	if content == "" {
-		return nil
-	}
-
-	// Use extracted username, then fall back to existing contact name, then truncated ID
-	displayName := senderUsername
-	if displayName == "" {
-		displayName = senderID
-		if len(senderID) > 8 {
-			displayName = "user-" + senderID[:8]
-		}
-	}
-	for _, c := range contacts {
-		if c.UserID == senderID {
-			displayName = c.Name
-			break
-		}
-	}
-	m.store.AddContact(senderID, displayName)
-
-	msgID := payload.MessageId
-	if msgID == "" {
-		msgID = uuid.NewString()
-	}
-
-	ts := time.Unix(payload.SentAt, 0)
-	if payload.SentAt == 0 {
-		ts = time.Unix(env.Timestamp, 0)
-	}
-
-	msg := &store.Message{
-		ID:        msgID,
-		ContactID: senderID,
-		Content:   content,
-		IsMine:    false,
-		Timestamp: ts,
-	}
-
-	m.store.SaveMessage(msg)
-
-	isActiveChat := m.chat.ContactID() == senderID
-
-	if isActiveChat {
-		m.chat.AppendMessage(*msg)
-	} else {
-		m.store.IncrementUnread(senderID)
-	}
-
-	go notify.NewMessage(displayName, content)
-
-	return func() tea.Msg { return contactsUpdatedMsg{} }
-}
-
-// ── View ──
 
 func (m AppModel) View() string {
-	var view string
-
-	switch m.screen {
-	case screenWelcome:
-		view = m.welcome.View()
-	case screenMain:
-		view = m.mainView()
+	if !m.ready {
+		return "connecting..."
 	}
 
-	if m.showHelp {
-		view = renderHelp(m.width, m.height)
+	// Calculate widths
+	contactsW := m.width * contactsWidthPct / 100
+	if contactsW < minContactsWidth {
+		contactsW = minContactsWidth
 	}
-
-	if m.toast != nil && time.Since(m.toast.ShowAt) < 3*time.Second {
-		toastView := m.toast.View(m.width)
-		lines := strings.Split(view, "\n")
-		toastLines := strings.Split(toastView, "\n")
-		for i, tl := range toastLines {
-			if i < len(lines) {
-				lines[i] = tl
-			}
-		}
-		view = strings.Join(lines, "\n")
+	if contactsW > maxContactsWidth {
+		contactsW = maxContactsWidth
 	}
+	chatW := m.width - contactsW - 1 // -1 for separator
 
-	return view
-}
+	mainHeight := m.height - 3 // status bar + input + extra line
 
-func (m AppModel) mainView() string {
-	topBar := m.renderTopBar()
-	contactsView := m.contacts.View()
+	// Contacts panel
+	m.contacts.SetSize(contactsW, mainHeight)
+	contactsView := m.contacts.View(m.activePanel == panelContacts)
+
+	// Chat panel
+	m.chat.SetSize(chatW, mainHeight)
 	chatView := m.chat.View()
 
-	// Separator column
-	contactsW := m.contacts.width
-	chatW := m.chat.width
-	mainH := m.height - 5
+	// Separator
+	sepStyle := lipgloss.NewStyle().
+		Foreground(nord3).
+		Height(mainHeight)
+	separator := sepStyle.Render(strings.Repeat("|\n", mainHeight))
 
-	sep := make([]string, mainH)
-	for i := range sep {
-		sep[i] = SeparatorStyle.Render("│")
-	}
-	separator := strings.Join(sep, "\n")
-
+	// Main area: contacts | separator | chat
 	mainArea := lipgloss.JoinHorizontal(lipgloss.Top, contactsView, separator, chatView)
 
-	modeLine := m.renderModeLine()
-	inputLine := m.renderInputLine(contactsW + 1 + chatW)
-	statusBar := m.renderStatusBar()
+	// Input line
+	inputView := m.renderInput()
+
+	// Status bar
+	m.statusBar.SetSize(m.width)
+	m.statusBar.SetContactCount(m.contacts.Count())
+	statusBarView := m.statusBar.View()
 
 	return lipgloss.JoinVertical(lipgloss.Left,
-		topBar,
 		mainArea,
-		modeLine,
-		inputLine,
-		statusBar,
+		inputView,
+		statusBarView,
 	)
 }
 
-func (m AppModel) renderTopBar() string {
-	left := " " + AppNameStyle.Render("cgram") + " " + SubtitleStyle.Render("v1.0.0")
-	right := TopBarHintStyle.Render(":help  Tab:switch  :q")
-
-	pad := m.width - lipgloss.Width(left) - lipgloss.Width(right) - 1
-	if pad < 0 {
-		pad = 0
+func (m *AppModel) updateLayout() {
+	contactsW := m.width * contactsWidthPct / 100
+	if contactsW < minContactsWidth {
+		contactsW = minContactsWidth
 	}
+	if contactsW > maxContactsWidth {
+		contactsW = maxContactsWidth
+	}
+	chatW := m.width - contactsW - 1
+	mainHeight := m.height - 3
 
-	content := left + strings.Repeat(" ", pad) + right + " "
-	return TopBarStyle.Width(m.width).Render(content)
+	m.contacts.SetSize(contactsW, mainHeight)
+	m.chat.SetSize(chatW, mainHeight)
+	m.statusBar.SetSize(m.width)
 }
 
-func (m AppModel) renderModeLine() string {
-	var badge string
-	var hints string
+func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	key := msg.String()
 
-	switch m.mode {
-	case modeNormal:
-		badge = ModeNormalBadge.Render("-- NORMAL --")
-		hints = ModeHintStyle.Render("  i:insert | a:append | ::command")
-	case modeInsert:
-		badge = ModeInsertBadge.Render("-- INSERT --")
-		hints = ModeHintStyle.Render("  Esc:normal | Enter:send | Alt+Enter:newline")
-	case modeCommand:
-		badge = ModeCommandBadge.Render("-- COMMAND --")
-		cmdText := CommandStyle.Render(":" + m.commandBuf)
-		cursor := lipgloss.NewStyle().Reverse(true).Render(" ")
-		hints = "  " + cmdText + cursor
-	}
-
-	return badge + hints
-}
-
-func (m AppModel) renderInputLine(totalW int) string {
-	prompt := PromptStyle.Render("$ ")
-
-	if m.mode != modeInsert {
-		placeholder := InputPlaceholderStyle.Render("Press 'i' to insert")
-		colInfo := ColStyle.Render("col: 1")
-		left := prompt + placeholder
-		pad := totalW - lipgloss.Width(left) - lipgloss.Width(colInfo)
-		if pad < 0 {
-			pad = 0
+	// Handle confirm mode first
+	if m.confirmAction != "" {
+		switch key {
+		case "y", "Y":
+			cmd := m.confirmCmd
+			m.confirmAction = ""
+			m.confirmCmd = nil
+			return m, cmd
+		default:
+			m.confirmAction = ""
+			m.confirmCmd = nil
+			return m, m.setStatus("cancelled", false)
 		}
-		return left + strings.Repeat(" ", pad) + colInfo
 	}
 
-	inputView := m.input.View()
-	colInfo := ColStyle.Render(fmt.Sprintf("col: %d", m.input.CursorCol()))
-	left := prompt + inputView
-	pad := totalW - lipgloss.Width(left) - lipgloss.Width(colInfo)
-	if pad < 0 {
-		pad = 0
+	// Global keys
+	switch key {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "tab":
+		if m.filterMode {
+			m.filterMode = false
+			m.contacts.SetFilter("")
+			m.textInput.SetValue("")
+			m.textInput.Prompt = "> "
+		}
+		if m.activePanel == panelContacts {
+			m.activePanel = panelChat
+		} else {
+			m.activePanel = panelContacts
+		}
+		return m, nil
+	case "esc":
+		if m.filterMode {
+			m.filterMode = false
+			m.contacts.SetFilter("")
+			m.textInput.SetValue("")
+			m.textInput.Prompt = "> "
+			return m, nil
+		}
+		if m.textInput.Value() != "" {
+			m.textInput.SetValue("")
+			return m, nil
+		}
+		return m, nil
 	}
-	return left + strings.Repeat(" ", pad) + colInfo
+
+	// Contacts panel navigation (only when input is empty and not in filter mode)
+	if m.activePanel == panelContacts && !m.filterMode && m.textInput.Value() == "" {
+		switch key {
+		case "up", "k":
+			m.contacts.MoveUp()
+			return m, nil
+		case "down", "j":
+			m.contacts.MoveDown()
+			return m, nil
+		case "enter":
+			return m.selectContact()
+		case "/":
+			m.filterMode = true
+			m.textInput.SetValue("")
+			m.textInput.Prompt = "/ "
+			return m, nil
+		}
+	}
+
+	// Chat panel scrolling (when input is empty)
+	if m.activePanel == panelChat && m.textInput.Value() == "" {
+		switch key {
+		case "up":
+			m.chat.ScrollUp()
+			return m, nil
+		case "down":
+			m.chat.ScrollDown()
+			return m, nil
+		case "pgup":
+			for i := 0; i < 10; i++ {
+				m.chat.ScrollUp()
+			}
+			return m, nil
+		case "pgdown":
+			for i := 0; i < 10; i++ {
+				m.chat.ScrollDown()
+			}
+			return m, nil
+		}
+	}
+
+	// Filter mode input
+	if m.filterMode {
+		switch key {
+		case "enter":
+			m.filterMode = false
+			m.textInput.Prompt = "> "
+			// Select first match
+			if sel := m.contacts.Selected(); sel != nil {
+				m.textInput.SetValue("")
+				return m.openChat(sel)
+			}
+			m.textInput.SetValue("")
+			return m, nil
+		default:
+			// Let textinput handle the keystroke
+			var cmd tea.Cmd
+			m.textInput, cmd = m.textInput.Update(msg)
+			m.contacts.SetFilter(m.textInput.Value())
+			return m, cmd
+		}
+	}
+
+	// Enter key handling
+	if key == "enter" {
+		return m.handleEnter()
+	}
+
+	// Update prompt style based on input
+	var cmd tea.Cmd
+	m.textInput, cmd = m.textInput.Update(msg)
+
+	// Dynamically update prompt
+	val := m.textInput.Value()
+	if strings.HasPrefix(val, ":") {
+		m.textInput.Prompt = ": "
+	} else {
+		m.textInput.Prompt = "> "
+	}
+
+	return m, cmd
 }
 
-func (m AppModel) renderStatusBar() string {
-	// Mode badge
-	var modeBadge string
-	switch m.mode {
-	case modeNormal:
-		modeBadge = StatusNormalBadge.Render("NORMAL")
-	case modeInsert:
-		modeBadge = StatusInsertBadge.Render("INSERT")
-	case modeCommand:
-		modeBadge = StatusCommandBadge.Render("COMMAND")
+func (m AppModel) handleEnter() (tea.Model, tea.Cmd) {
+	text := strings.TrimSpace(m.textInput.Value())
+	if text == "" {
+		return m, nil
 	}
 
-	// Chat info
-	chatInfo := ""
-	if m.chat.ContactID() != "" {
-		chatInfo = "  " + SubtitleStyle.Render("chat:") + " " +
-			ChatHeaderNameStyle.Render("@"+m.chat.ContactName()) +
-			" " + SubtitleStyle.Render(fmt.Sprintf("[%d]", m.chat.MessageCount()))
+	// Command handling
+	if strings.HasPrefix(text, ":") {
+		return m.handleCommand(text)
 	}
 
-	// Pane indicators
-	contactsPane := StatusPaneDimStyle.Render("[1:contacts]")
-	chatPane := StatusPaneDimStyle.Render("[2:chat]")
-	inputPane := StatusPaneDimStyle.Render("[3:input]")
-	if m.focus == focusContacts {
-		contactsPane = StatusPaneActiveStyle.Render("[1:contacts]")
-	} else if m.focus == focusChat {
-		chatPane = StatusPaneActiveStyle.Render("[2:chat]")
-	}
-	if m.mode == modeInsert {
-		inputPane = StatusPaneActiveStyle.Render("[3:input]")
-	}
-	panes := "  " + contactsPane + " " + chatPane + " " + inputPane
-
-	// Connection + e2e + time
-	connStatus := StatusConnectedStyle.Render("● connected")
-	if !m.client.Connected() {
-		connStatus = StatusDisconnectedStyle.Render("● disconnected")
-	}
-	e2e := StatusE2EStyle.Render("■ e2e")
-	clock := SubtitleStyle.Render(time.Now().Format("15:04:05"))
-	right := "  " + connStatus + "  " + e2e + "  " + clock
-
-	left := modeBadge + chatInfo + panes
-
-	pad := m.width - lipgloss.Width(left) - lipgloss.Width(right) - 2
-	if pad < 0 {
-		pad = 0
+	// Send message
+	if m.chat.PeerID() == "" {
+		m.textInput.SetValue("")
+		return m, m.setStatus("no contact selected", true)
 	}
 
-	content := " " + left + strings.Repeat(" ", pad) + right + " "
-	return StatusBarStyle.Width(m.width).Render(content)
+	m.textInput.SetValue("")
+	return m, m.sendMessage(m.chat.PeerID(), m.chat.PeerName(), text)
 }
 
-func (m AppModel) waitForMessage() tea.Cmd {
-	ch := m.client.Incoming
+func (m AppModel) handleCommand(text string) (tea.Model, tea.Cmd) {
+	parts := strings.Fields(text)
+	if len(parts) == 0 {
+		return m, nil
+	}
+
+	cmd := strings.ToLower(parts[0])
+	m.textInput.SetValue("")
+
+	switch cmd {
+	case ":add":
+		if len(parts) < 2 {
+			return m, m.setStatus(":add <username>", true)
+		}
+		return m, m.addContact(parts[1])
+
+	case ":delete":
+		if len(parts) < 2 {
+			return m, m.setStatus(":delete <username>", true)
+		}
+		username := parts[1]
+		m.confirmAction = fmt.Sprintf("delete contact '%s'? (y/n)", username)
+		m.confirmCmd = m.deleteContact(username)
+		return m, nil
+
+	case ":rename":
+		if len(parts) < 3 {
+			return m, m.setStatus(":rename <username> <new_alias>", true)
+		}
+		if err := m.store.RenameContact(parts[1], parts[2]); err != nil {
+			return m, m.setStatus(fmt.Sprintf("rename failed: %v", err), true)
+		}
+		return m, m.setStatus(fmt.Sprintf("renamed %s -> %s", parts[1], parts[2]), false)
+
+	case ":search":
+		if len(parts) < 2 {
+			return m, m.setStatus(":search <query>", true)
+		}
+		query := strings.Join(parts[1:], " ")
+		// Search contacts first
+		if c := m.contacts.FindByUsername(query); c != nil {
+			return m.openChat(c)
+		}
+		// Search messages
+		msgs, err := m.store.SearchMessages(query, 20)
+		if err == nil && len(msgs) > 0 {
+			return m, m.setStatus(fmt.Sprintf("found %d message(s) for '%s'", len(msgs), query), false)
+		}
+		return m, m.setStatus(fmt.Sprintf("no results for '%s'", query), true)
+
+	case ":q", ":quit":
+		return m, tea.Quit
+
+	default:
+		return m, m.setStatus(fmt.Sprintf("unknown command: %s", cmd), true)
+	}
+}
+
+func (m AppModel) selectContact() (tea.Model, tea.Cmd) {
+	sel := m.contacts.Selected()
+	if sel == nil {
+		return m, nil
+	}
+	return m.openChat(sel)
+}
+
+func (m AppModel) openChat(c *ContactEntry) (tea.Model, tea.Cmd) {
+	m.chat.SetPeer(c.UserID, c.Username)
+	m.contacts.ClearUnread(c.UserID)
+	m.activePanel = panelChat
+
+	// Load messages from store
+	msgs, err := m.store.GetMessages(c.UserID, 100, 0)
+	if err != nil {
+		return m, m.setStatus(fmt.Sprintf("load messages: %v", err), true)
+	}
+	m.chat.SetMessages(msgs)
+
+	return m, nil
+}
+
+func (m AppModel) handlePush(frame *pb.Frame) (tea.Model, tea.Cmd) {
+	if frame == nil {
+		// Connection closed — watchConnection will handle reconnect
+		return m, nil
+	}
+
+	switch p := frame.Payload.(type) {
+	case *pb.Frame_Envelope:
+		return m.handleIncomingEnvelope(p.Envelope)
+	case *pb.Frame_PresenceEvent:
+		m.contacts.UpdatePresence(p.PresenceEvent.UserId, p.PresenceEvent.Online)
+		status := "offline"
+		if p.PresenceEvent.Online {
+			status = "online"
+		}
+		return m, tea.Batch(
+			m.setStatus(fmt.Sprintf("%s is %s", p.PresenceEvent.Username, status), false),
+			m.waitForPush,
+		)
+	}
+
+	return m, m.waitForPush
+}
+
+func (m AppModel) handleIncomingEnvelope(env *pb.Envelope) (tea.Model, tea.Cmd) {
+	// For now, treat ciphertext as plaintext (simplified — full E2E TBD)
+	body := string(env.Ciphertext)
+	senderID := string(env.SenderSealed)
+
+	// Find sender name from contacts
+	senderName := senderID
+	for _, c := range m.contacts.contacts {
+		if c.UserID == senderID {
+			senderName = c.Username
+			break
+		}
+	}
+
+	now := time.Now()
+	if env.Timestamp > 0 {
+		now = time.Unix(env.Timestamp, 0)
+	}
+
+	msg := store.Message{
+		PeerID:    senderID,
+		Sender:    senderName,
+		Body:      body,
+		Timestamp: now,
+		Outgoing:  false,
+	}
+
+	if err := m.store.SaveMessage(msg.PeerID, msg.Sender, msg.Body, msg.Timestamp, false); err != nil {
+		// log save error but continue displaying the message
+	}
+
+	if m.chat.PeerID() == senderID {
+		m.chat.AddMessage(msg)
+	} else {
+		m.contacts.IncrementUnread(senderID)
+	}
+
+	return m, m.waitForPush
+}
+
+func (m AppModel) renderInput() string {
+	// Show confirm prompt if active
+	if m.confirmAction != "" {
+		prompt := inputPromptStyle.Render("? ") + inputStyle.Render(m.confirmAction)
+		return inputStyle.Width(m.width).Render(prompt)
+	}
+
+	// Show status message alongside input if active
+	if m.statusText != "" && time.Now().Before(m.statusExpiry) {
+		style := infoStyle
+		if m.statusIsError {
+			style = errorStyle
+		}
+		right := style.Render(m.statusText)
+		left := m.textInput.View()
+		gap := m.width - lipgloss.Width(left) - lipgloss.Width(right) - 2
+		if gap < 1 {
+			gap = 1
+		}
+		return inputStyle.Width(m.width).Render(left + strings.Repeat(" ", gap) + right)
+	}
+
+	return inputStyle.Width(m.width).Render(m.textInput.View())
+}
+
+// Commands that return tea.Cmd
+func (m AppModel) loadContacts() tea.Msg {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	contacts, err := m.client.ListContacts(ctx)
+	if err != nil {
+		return statusMsg{text: fmt.Sprintf("failed to load contacts: %v", err), isError: true}
+	}
+	return contactsLoadedMsg(contacts)
+}
+
+func (m AppModel) loadStats() tea.Msg {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stats, err := m.client.GetStats(ctx)
+	if err != nil {
+		return nil
+	}
+	return statsLoadedMsg(stats)
+}
+
+func (m AppModel) waitForPush() tea.Msg {
+	frame := m.client.WaitForPush()
+	return pushFrameMsg(frame)
+}
+
+func (m AppModel) tickEverySecond() tea.Msg {
+	time.Sleep(time.Second)
+	return tickMsg(time.Now())
+}
+
+// watchConnection waits for the current connection to drop, then signals the TUI.
+func (m AppModel) watchConnection() tea.Msg {
+	<-m.client.Done()
+	return disconnectedMsg{}
+}
+
+// reconnect attempts to re-establish the WebSocket connection.
+func (m AppModel) reconnect() tea.Msg {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := m.client.ReconnectLoop(ctx); err != nil {
+		return statusMsg{text: fmt.Sprintf("reconnect failed: %v", err), isError: true}
+	}
+	return reconnectedMsg{}
+}
+
+func (m AppModel) setStatus(text string, isError bool) tea.Cmd {
 	return func() tea.Msg {
-		frame := <-ch
-		return incomingFrameMsg{frame: frame}
+		return statusMsg{text: text, isError: isError}
+	}
+}
+
+func (m AppModel) sendMessage(peerID, peerName, text string) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		now := time.Now()
+
+		// Simplified: send plaintext for now (full E2E encryption TBD)
+		env := &pb.Envelope{
+			RecipientId:  peerID,
+			SenderSealed: []byte(m.username),
+			Ciphertext:   []byte(text),
+			Timestamp:    now.Unix(),
+		}
+
+		if err := m.client.SendEnvelope(ctx, env); err != nil {
+			return statusMsg{text: fmt.Sprintf("send failed: %v", err), isError: true}
+		}
+
+		// Save locally
+		if err := m.store.SaveMessage(peerID, m.username, text, now, true); err != nil {
+			// continue — message was sent, just not saved locally
+		}
+
+		return messageSentMsg(store.Message{
+			PeerID:    peerID,
+			Sender:    m.username,
+			Body:      text,
+			Timestamp: now,
+			Outgoing:  true,
+		})
+	}
+}
+
+func (m AppModel) addContact(username string) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		resp, err := m.client.AddContact(ctx, username)
+		if err != nil {
+			return statusMsg{text: fmt.Sprintf("add failed: %v", err), isError: true}
+		}
+
+		if err := m.store.SaveContact(resp.UserId, resp.Username); err != nil {
+			// non-fatal
+		}
+
+		// Reload contacts
+		contacts, _ := m.client.ListContacts(ctx)
+		if contacts != nil {
+			return contactsLoadedMsg(contacts)
+		}
+
+		return statusMsg{text: fmt.Sprintf("added %s", username), isError: false}
+	}
+}
+
+func (m AppModel) deleteContact(username string) tea.Cmd {
+	return func() tea.Msg {
+		// Find user ID by username
+		userID, err := m.store.GetContactUserID(username)
+		if err != nil {
+			return statusMsg{text: fmt.Sprintf("contact '%s' not found", username), isError: true}
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := m.client.RemoveContact(ctx, userID); err != nil {
+			return statusMsg{text: fmt.Sprintf("delete failed: %v", err), isError: true}
+		}
+
+		if err := m.store.DeleteContact(userID); err != nil {
+			// non-fatal
+		}
+
+		// Reload contacts
+		contacts, _ := m.client.ListContacts(ctx)
+		if contacts != nil {
+			return contactsLoadedMsg(contacts)
+		}
+
+		return statusMsg{text: fmt.Sprintf("deleted %s", username), isError: false}
 	}
 }

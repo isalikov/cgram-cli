@@ -2,221 +2,154 @@ package crypto
 
 import (
 	"crypto/ed25519"
-	"crypto/rand"
-	"crypto/sha256"
-	"crypto/sha512"
-	"encoding/binary"
+	cryptorand "crypto/rand"
+	"encoding/json"
 	"fmt"
-	"io"
+	"os"
 
 	"filippo.io/edwards25519"
 	"golang.org/x/crypto/curve25519"
-	"golang.org/x/crypto/hkdf"
-	"golang.org/x/crypto/nacl/secretbox"
+	"golang.org/x/crypto/nacl/box"
+
+	pb "github.com/isalikov/cgram-proto/gen/proto"
 )
 
-// hkdfSalt is a fixed protocol salt for HKDF derivations.
-var hkdfSalt = []byte("cgram-hkdf-salt-v1")
-
-const (
-	NonceSize = 24
-	KeySize   = 32
-)
-
+// KeyPair holds an Ed25519 identity key pair.
 type KeyPair struct {
-	Private []byte
-	Public  []byte
+	PublicKey  ed25519.PublicKey  `json:"public_key"`
+	PrivateKey ed25519.PrivateKey `json:"private_key"`
 }
 
-// GenerateEd25519 creates an Ed25519 signing key pair.
-func GenerateEd25519() (*KeyPair, error) {
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+// Session holds the shared secret for a peer.
+type Session struct {
+	PeerID       string   `json:"peer_id"`
+	SharedSecret [32]byte `json:"shared_secret"`
+}
+
+// PreKeyResult holds the bundle to upload and the private keys to store locally.
+type PreKeyResult struct {
+	Bundle          *pb.PreKeyBundle
+	SignedPreKeyPriv [32]byte
+	OneTimeKeyPrivs  [][32]byte
+}
+
+// LoadOrCreateIdentity loads or generates an Ed25519 key pair.
+func LoadOrCreateIdentity(path string) (*KeyPair, error) {
+	data, err := os.ReadFile(path)
+	if err == nil {
+		// Verify file permissions (should be 0600)
+		info, statErr := os.Stat(path)
+		if statErr == nil && info.Mode().Perm()&0077 != 0 {
+			if chErr := os.Chmod(path, 0600); chErr != nil {
+				return nil, fmt.Errorf("key file has insecure permissions and chmod failed: %w", chErr)
+			}
+		}
+
+		var kp KeyPair
+		if err := json.Unmarshal(data, &kp); err != nil {
+			return nil, fmt.Errorf("parse key file: %w", err)
+		}
+		return &kp, nil
+	}
+
+	pub, priv, err := ed25519.GenerateKey(cryptorand.Reader)
 	if err != nil {
-		return nil, fmt.Errorf("generate ed25519: %w", err)
+		return nil, fmt.Errorf("generate key: %w", err)
 	}
-	return &KeyPair{Private: priv, Public: pub}, nil
+
+	kp := &KeyPair{PublicKey: pub, PrivateKey: priv}
+	data, _ = json.Marshal(kp)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return nil, fmt.Errorf("save key: %w", err)
+	}
+	return kp, nil
 }
 
-// GenerateX25519 creates an X25519 key pair for Diffie-Hellman.
-func GenerateX25519() (*KeyPair, error) {
-	var priv [KeySize]byte
-	if _, err := rand.Read(priv[:]); err != nil {
-		return nil, fmt.Errorf("generate x25519 private: %w", err)
-	}
-	clampPrivateKey(&priv)
-
-	pub, err := curve25519.X25519(priv[:], curve25519.Basepoint)
+// GeneratePreKeyBundle creates signed pre-key and one-time keys for upload.
+// Returns both the bundle (for server) and private keys (for local storage).
+func GeneratePreKeyBundle(identity *KeyPair) (*PreKeyResult, error) {
+	// Generate X25519 signed pre-key
+	signedPreKeyPriv, signedPreKeyPub, err := generateX25519KeyPair()
 	if err != nil {
-		return nil, fmt.Errorf("generate x25519 public: %w", err)
+		return nil, fmt.Errorf("generate signed pre-key: %w", err)
 	}
 
-	return &KeyPair{Private: priv[:], Public: pub}, nil
+	// Sign the pre-key with identity key
+	signature := ed25519.Sign(identity.PrivateKey, signedPreKeyPub[:])
+
+	// Generate one-time pre-keys
+	var oneTimeKeys [][]byte
+	var oneTimePrivs [][32]byte
+	for i := 0; i < 20; i++ {
+		priv, pub, err := generateX25519KeyPair()
+		if err != nil {
+			return nil, fmt.Errorf("generate one-time key %d: %w", i, err)
+		}
+		oneTimeKeys = append(oneTimeKeys, pub[:])
+		oneTimePrivs = append(oneTimePrivs, priv)
+	}
+
+	return &PreKeyResult{
+		Bundle: &pb.PreKeyBundle{
+			IdentityKey:           identity.PublicKey,
+			SignedPreKey:          signedPreKeyPub[:],
+			SignedPreKeySignature: signature,
+			OneTimePreKeys:        oneTimeKeys,
+		},
+		SignedPreKeyPriv: signedPreKeyPriv,
+		OneTimeKeyPrivs:  oneTimePrivs,
+	}, nil
 }
 
-func clampPrivateKey(key *[KeySize]byte) {
-	key[0] &= 248
-	key[31] &= 127
-	key[31] |= 64
-}
+// Ed25519ToX25519 converts an Ed25519 public key to X25519 using proper
+// Edwards-to-Montgomery point conversion.
+func Ed25519ToX25519(edPub ed25519.PublicKey) ([32]byte, error) {
+	var x25519Pub [32]byte
+	if len(edPub) != 32 {
+		return x25519Pub, fmt.Errorf("invalid ed25519 public key length")
+	}
 
-// Ed25519ToX25519Private converts an Ed25519 private key to X25519.
-func Ed25519ToX25519Private(edPriv ed25519.PrivateKey) []byte {
-	h := sha512.Sum512(edPriv.Seed())
-	h[0] &= 248
-	h[31] &= 127
-	h[31] |= 64
-	return h[:KeySize]
-}
-
-// Ed25519ToX25519Public converts an Ed25519 public key to X25519
-// using proper Edwards-to-Montgomery conversion.
-func Ed25519ToX25519Public(edPub ed25519.PublicKey) ([]byte, error) {
 	p, err := new(edwards25519.Point).SetBytes(edPub)
 	if err != nil {
-		return nil, fmt.Errorf("invalid ed25519 public key: %w", err)
+		return x25519Pub, fmt.Errorf("invalid ed25519 public key: %w", err)
 	}
-	return p.BytesMontgomery(), nil
+
+	copy(x25519Pub[:], p.BytesMontgomery())
+	return x25519Pub, nil
 }
 
-// Sign signs a message with an Ed25519 private key.
-func Sign(privateKey, message []byte) []byte {
-	return ed25519.Sign(ed25519.PrivateKey(privateKey), message)
+func generateX25519KeyPair() (priv [32]byte, pub [32]byte, err error) {
+	if _, err = cryptorand.Read(priv[:]); err != nil {
+		return
+	}
+	curve25519.ScalarBaseMult(&pub, &priv)
+	return
 }
 
-// Verify checks an Ed25519 signature.
-func Verify(publicKey, message, signature []byte) bool {
-	if len(publicKey) != ed25519.PublicKeySize {
-		return false
-	}
-	return ed25519.Verify(ed25519.PublicKey(publicKey), message, signature)
-}
-
-// X3DH performs a simplified X3DH key agreement.
-// Returns a shared secret derived from the DH exchanges.
-func X3DH(ourX25519Priv []byte, theirSignedPreKey []byte, theirOneTimeKey []byte) ([]byte, error) {
-	// DH1: our identity x25519 * their signed pre-key
-	dh1, err := curve25519.X25519(ourX25519Priv, theirSignedPreKey)
-	if err != nil {
-		return nil, fmt.Errorf("dh1: %w", err)
-	}
-
-	// Generate ephemeral key for DH2
-	ephemeral, err := GenerateX25519()
-	if err != nil {
-		return nil, fmt.Errorf("ephemeral: %w", err)
-	}
-
-	// DH2: ephemeral * their signed pre-key
-	dh2, err := curve25519.X25519(ephemeral.Private, theirSignedPreKey)
-	if err != nil {
-		return nil, fmt.Errorf("dh2: %w", err)
-	}
-
-	// Combine DH results
-	input := append(dh1, dh2...)
-
-	// DH3: ephemeral * their one-time key (if available)
-	if len(theirOneTimeKey) == KeySize {
-		dh3, err := curve25519.X25519(ephemeral.Private, theirOneTimeKey)
-		if err == nil {
-			input = append(input, dh3...)
-		}
-	}
-
-	// Derive shared secret using HKDF
-	return deriveKey(input, []byte("cgram-x3dh-v1"))
-}
-
-// DeriveSharedSecret creates a shared secret from a DH exchange for an existing session.
-func DeriveSharedSecret(ourPriv, theirPub []byte) ([]byte, error) {
-	shared, err := curve25519.X25519(ourPriv, theirPub)
-	if err != nil {
-		return nil, err
-	}
-	return deriveKey(shared, []byte("cgram-session-v1"))
-}
-
-func deriveKey(input, info []byte) ([]byte, error) {
-	r := hkdf.New(sha256.New, input, hkdfSalt, info)
-	key := make([]byte, KeySize)
-	if _, err := io.ReadFull(r, key); err != nil {
-		return nil, fmt.Errorf("hkdf: %w", err)
-	}
-	return key, nil
-}
-
-// Encrypt encrypts plaintext using the shared secret and ratchet index.
-func Encrypt(sharedSecret []byte, ratchetIndex uint32, plaintext []byte) ([]byte, error) {
-	// Derive message key from shared secret + ratchet index
-	msgKey, err := deriveMessageKey(sharedSecret, ratchetIndex)
-	if err != nil {
-		return nil, err
-	}
-
-	var key [KeySize]byte
-	copy(key[:], msgKey)
-
-	var nonce [NonceSize]byte
-	binary.BigEndian.PutUint32(nonce[:4], ratchetIndex)
-	if _, err := rand.Read(nonce[8:]); err != nil {
+// Encrypt encrypts a message using NaCl box with the shared secret.
+func Encrypt(message []byte, sharedSecret *[32]byte) ([]byte, error) {
+	var nonce [24]byte
+	if _, err := cryptorand.Read(nonce[:]); err != nil {
 		return nil, fmt.Errorf("generate nonce: %w", err)
 	}
 
-	encrypted := secretbox.Seal(nonce[:], plaintext, &nonce, &key)
+	encrypted := box.SealAfterPrecomputation(nonce[:], message, &nonce, sharedSecret)
 	return encrypted, nil
 }
 
-// Decrypt decrypts ciphertext using the shared secret and ratchet index.
-func Decrypt(sharedSecret []byte, ratchetIndex uint32, ciphertext []byte) ([]byte, error) {
-	if len(ciphertext) < NonceSize+secretbox.Overhead {
+// Decrypt decrypts a message using NaCl box with the shared secret.
+func Decrypt(encrypted []byte, sharedSecret *[32]byte) ([]byte, error) {
+	if len(encrypted) < 24 {
 		return nil, fmt.Errorf("ciphertext too short")
 	}
 
-	msgKey, err := deriveMessageKey(sharedSecret, ratchetIndex)
-	if err != nil {
-		return nil, err
-	}
+	var nonce [24]byte
+	copy(nonce[:], encrypted[:24])
 
-	var key [KeySize]byte
-	copy(key[:], msgKey)
-
-	var nonce [NonceSize]byte
-	copy(nonce[:], ciphertext[:NonceSize])
-
-	plaintext, ok := secretbox.Open(nil, ciphertext[NonceSize:], &nonce, &key)
+	decrypted, ok := box.OpenAfterPrecomputation(nil, encrypted[24:], &nonce, sharedSecret)
 	if !ok {
 		return nil, fmt.Errorf("decryption failed")
 	}
 
-	return plaintext, nil
-}
-
-func deriveMessageKey(sharedSecret []byte, index uint32) ([]byte, error) {
-	indexBytes := make([]byte, 4)
-	binary.BigEndian.PutUint32(indexBytes, index)
-
-	input := make([]byte, len(sharedSecret)+4)
-	copy(input, sharedSecret)
-	copy(input[len(sharedSecret):], indexBytes)
-	return deriveKey(input, []byte("cgram-msg-v1"))
-}
-
-// GeneratePreKeyBundle creates a set of pre-keys for X3DH.
-func GeneratePreKeyBundle(identityPrivate []byte, n int) (signedPreKey *KeyPair, signature []byte, oneTimeKeys []*KeyPair, err error) {
-	signedPreKey, err = GenerateX25519()
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("signed pre-key: %w", err)
-	}
-
-	signature = Sign(identityPrivate, signedPreKey.Public)
-
-	oneTimeKeys = make([]*KeyPair, n)
-	for i := range n {
-		oneTimeKeys[i], err = GenerateX25519()
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("one-time key %d: %w", i, err)
-		}
-	}
-
-	return signedPreKey, signature, oneTimeKeys, nil
+	return decrypted, nil
 }
